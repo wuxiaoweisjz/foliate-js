@@ -226,7 +226,7 @@ const setSelectionTo = (target, collapse) => {
 // viewport as `aria-hidden`. Views still visible to sighted users (e.g. the
 // right column in a dual-page spread that belongs to a different section
 // than the left column) stay exposed to assistive tech.
-// See readest/readest#4243 and readest/readest#4259.
+// See readia/readia#4243 and readia/readia#4259.
 export const isViewVisibleInContainer = (viewRect, containerRect) =>
     viewRect.right > containerRect.left
     && viewRect.left < containerRect.right
@@ -1195,7 +1195,7 @@ export class Paginator extends HTMLElement {
     // Only `aria-hidden` is used — `inert` would also block pointer events
     // and text selection, which breaks visible non-primary views such as
     // the right column of a dual-page spread when each column belongs to
-    // a different section (readest/readest#4243, readest/readest#4259).
+    // a different section (readia/readia#4243, readia/readia#4259).
     //
     // Visible non-primary views stay exposed to assistive tech because a
     // sighted user can read them on the same spread.

@@ -323,6 +323,7 @@ export class FixedLayout extends HTMLElement {
             }
             const iframeScale = onZoom ? scale : 1
             const zoomedOut = this.#scaleFactor < 1.0
+            const shouldPinBlockStart = onZoom && this.#zoom === 'fit-width'
             Object.assign(iframe.style, {
                 width: `${width * iframeScale}px`,
                 height: `${height * iframeScale}px`,
@@ -335,7 +336,8 @@ export class FixedLayout extends HTMLElement {
                 height: `${(height ?? blankHeight) * scale}px`,
                 flexShrink: '0',
                 display: zoomedOut ? 'flex' : 'block',
-                marginBlock: zoomedOut ? undefined : 'auto',
+                marginBlock: zoomedOut || shouldPinBlockStart ? undefined : 'auto',
+                alignSelf: shouldPinBlockStart ? 'flex-start' : undefined,
                 alignItems: zoomedOut ? 'center' : undefined,
                 justifyContent: zoomedOut ? 'center' : undefined,
                 ...styles,

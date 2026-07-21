@@ -179,6 +179,170 @@ const concatTypedArray3 = (a, b, c) => {
     return result
 }
 
+class ChunkedByteBuffer {
+    #chunks = []
+    #length = 0
+    #onMaterialize
+    constructor(onMaterialize) {
+        this.#onMaterialize = onMaterialize
+    }
+    get length() {
+        return this.#length
+    }
+    append(chunk) {
+        this.#chunks.push(chunk)
+        this.#length += chunk.length
+    }
+    prepend(chunk) {
+        this.#chunks.unshift(chunk)
+        this.#length += chunk.length
+    }
+    slice(start, end) {
+        const from = Math.max(0, start)
+        const to = Math.min(this.#length, Math.max(from, end))
+        const result = new Uint8Array(to - from)
+        this.#onMaterialize?.(result.length)
+        let chunkStart = 0
+        let resultOffset = 0
+        for (const chunk of this.#chunks) {
+            const chunkEnd = chunkStart + chunk.length
+            const copyStart = Math.max(from, chunkStart)
+            const copyEnd = Math.min(to, chunkEnd)
+            if (copyStart < copyEnd) {
+                const sourceStart = copyStart - chunkStart
+                const sourceEnd = copyEnd - chunkStart
+                result.set(chunk.subarray(sourceStart, sourceEnd), resultOffset)
+                resultOffset += sourceEnd - sourceStart
+            }
+            if (chunkEnd >= to) break
+            chunkStart = chunkEnd
+        }
+        return result
+    }
+}
+
+const KF8_PREFETCH_CONCURRENCY = 8
+
+export class KF8RawCache {
+    #availableLoadSlots = KF8_PREFETCH_CONCURRENCY
+    #fullLength
+    #head
+    #headQueue = Promise.resolve()
+    #lastLoadedHead = -1
+    #lastLoadedTail = -1
+    #loadRecord
+    #loadRecords
+    #loadSlotWaiters = []
+    #numTextRecords
+    #tail
+    /**
+     * @param {{
+     *   fullLength: number | undefined,
+     *   loadRecord: (index: number) => Promise<Uint8Array>,
+     *   loadRecords?: (indices: number[]) => Promise<Uint8Array[]>,
+     *   numTextRecords: number,
+     *   onMaterialize?: (byteLength: number) => void,
+     * }} options
+     */
+    constructor({
+        fullLength,
+        loadRecord,
+        loadRecords,
+        numTextRecords,
+        onMaterialize,
+    }) {
+        this.#fullLength = fullLength
+        this.#loadRecord = loadRecord
+        this.#loadRecords = loadRecords
+        this.#numTextRecords = numTextRecords
+        this.#head = new ChunkedByteBuffer(onMaterialize)
+        this.#tail = new ChunkedByteBuffer(onMaterialize)
+    }
+    async #acquireLoadSlot() {
+        if (this.#availableLoadSlots > 0) {
+            this.#availableLoadSlots--
+            return
+        }
+        await new Promise(resolve => this.#loadSlotWaiters.push(resolve))
+    }
+    #releaseLoadSlot() {
+        const next = this.#loadSlotWaiters.shift()
+        if (next) next()
+        else this.#availableLoadSlots++
+    }
+    async #loadBatch(indices) {
+        if (this.#loadRecords) {
+            await this.#acquireLoadSlot()
+            try {
+                return await this.#loadRecords(indices)
+            } finally {
+                this.#releaseLoadSlot()
+            }
+        }
+        const results = await Promise.all(indices.map(async index => {
+            await this.#acquireLoadSlot()
+            try {
+                return { data: await this.#loadRecord(index) }
+            } catch (error) {
+                return { error }
+            } finally {
+                this.#releaseLoadSlot()
+            }
+        }))
+        const failure = results.find(result => 'error' in result)
+        if (failure) throw failure.error
+        return results.map(result => result.data)
+    }
+    async #extendHead(end) {
+        while (this.#head.length < end) {
+            const firstIndex = this.#lastLoadedHead + 1
+            if (firstIndex >= this.#numTextRecords)
+                throw new RangeError('Text record index out of bounds')
+            const count = Math.min(
+                KF8_PREFETCH_CONCURRENCY,
+                this.#numTextRecords - firstIndex,
+            )
+            const indices = Array.from({ length: count }, (_, offset) => firstIndex + offset)
+            const records = await this.#loadBatch(indices)
+            for (const record of records) this.#head.append(record)
+            this.#lastLoadedHead += records.length
+        }
+    }
+    async #extendTail(start) {
+        while (this.#fullLength - this.#tail.length > start) {
+            const firstIndex = this.#numTextRecords - 2 - this.#lastLoadedTail
+            if (firstIndex < 0)
+                throw new RangeError('Text record index out of bounds')
+            const count = Math.min(KF8_PREFETCH_CONCURRENCY, firstIndex + 1)
+            const indices = Array.from({ length: count }, (_, offset) => firstIndex - offset)
+            const records = await this.#loadBatch(indices)
+            for (const record of records) this.#tail.prepend(record)
+            this.#lastLoadedTail += records.length
+        }
+    }
+    async load(start, end) {
+        if (start < 0 || end < start || this.#fullLength != null && end > this.#fullLength)
+            throw new RangeError('Raw text range out of bounds')
+        if (start === end) return new Uint8Array()
+        const distanceHead = end - this.#head.length
+        const distanceEnd = this.#fullLength == null ? Infinity
+            : (this.#fullLength - this.#tail.length) - start
+        if (distanceHead < 0 || distanceHead < distanceEnd) {
+            const task = this.#headQueue.then(() => this.#extendHead(end))
+            this.#headQueue = task.catch(() => {})
+            await task
+            return this.#head.slice(start, end)
+        }
+
+        const task = this.#tailQueue.then(() => this.#extendTail(start))
+        this.#tailQueue = task.catch(() => {})
+        await task
+        const rawTailStart = this.#fullLength - this.#tail.length
+        return this.#tail.slice(start - rawTailStart, end - rawTailStart)
+    }
+    #tailQueue = Promise.resolve()
+}
+
 const decoder = new TextDecoder()
 const getString = buffer => decoder.decode(buffer)
 const getUint = buffer => {
@@ -502,6 +666,22 @@ class PDB {
         if (!offsets) throw new RangeError('Record index out of bounds')
         return this.#file.slice(...offsets).arrayBuffer()
     }
+    loadRecords(indices) {
+        if (!indices.length) return Promise.resolve([])
+        const ranges = indices.map(index => {
+            const offsets = this.#offsets[index]
+            if (!offsets) throw new RangeError('Record index out of bounds')
+            return offsets
+        })
+        const start = Math.min(...ranges.map(([start]) => start))
+        const end = Math.max(...ranges.map(([, end]) => end ?? this.#file.size))
+        return this.#file.slice(start, end).arrayBuffer().then(buffer => ranges.map(
+            ([recordStart, recordEnd]) => buffer.slice(
+                recordStart - start,
+                (recordEnd ?? this.#file.size) - start,
+            ),
+        ))
+    }
     async loadMagic(index) {
         const start = this.#offsets[index][0]
         return getString(await this.#file.slice(start, start + 4).arrayBuffer())
@@ -599,10 +779,16 @@ export class MOBI extends PDB {
         return super.loadMagic(this.#start + index)
     }
     loadText(index) {
-        return this.loadRecord(index + 1)
-            .then(buf => new Uint8Array(buf))
-            .then(this.#removeTrailingEntries)
-            .then(this.#decompress)
+        return this.loadTexts([index]).then(records => records[0])
+    }
+    async loadTexts(indices) {
+        const records = await super.loadRecords(
+            indices.map(index => this.#start + index + 1),
+        )
+        return Promise.all(records.map(async buf => {
+            const data = this.#removeTrailingEntries(new Uint8Array(buf))
+            return this.#decompress(data)
+        }))
     }
     async loadResource(index) {
         const buf = await super.loadRecord(this.#resourceStart + index)
@@ -923,13 +1109,36 @@ const getFragmentSelector = str => {
     return `[${attr}="${CSS.escape(value)}"]`
 }
 
-// replace asynchronously and sequentially
-const replaceSeries = async (str, regex, f) => {
+const KF8_RESOURCE_CONCURRENCY = 8
+
+// Resolve matches concurrently, then apply results in source order.
+const replaceConcurrent = async (str, regex, f) => {
     const matches = []
     str.replace(regex, (...args) => (matches.push(args), null))
-    const results = []
-    for (const args of matches) results.push(await f(...args))
-    return str.replace(regex, () => results.shift())
+    const results = new Array(matches.length)
+    let failure
+    let failed = false
+    let nextIndex = 0
+    const worker = async () => {
+        while (!failed && nextIndex < matches.length) {
+            const index = nextIndex++
+            try {
+                results[index] = await f(...matches[index])
+            } catch (error) {
+                if (!failed) {
+                    failed = true
+                    failure = error
+                }
+            }
+        }
+    }
+    await Promise.all(Array.from(
+        { length: Math.min(KF8_RESOURCE_CONCURRENCY, matches.length) },
+        worker,
+    ))
+    if (failed) throw failure
+    let resultIndex = 0
+    return str.replace(regex, () => results[resultIndex++])
 }
 
 const getPageSpread = properties => {
@@ -942,20 +1151,22 @@ const getPageSpread = properties => {
     }
 }
 
-class KF8 {
+export class KF8 {
     parser = new DOMParser()
     serializer = new XMLSerializer()
     transformTarget = new EventTarget()
+    #availableResourceLoadSlots = KF8_RESOURCE_CONCURRENCY
     #cache = new Map()
     #fragmentOffsets = new Map()
     #fragmentSelectors = new Map()
     #tables = {}
     #sections
     #fullRawLength
-    #rawHead = new Uint8Array()
-    #rawTail = new Uint8Array()
-    #lastLoadedHead = -1
-    #lastLoadedTail = -1
+    #rawCache
+    #resourceCache = new Map()
+    #resourceLoadWaiters = []
+    #resourceURLs = new Set()
+    #sectionURLs = new Set()
     #type = MIME.XHTML
     #inlineMap = new Map()
     constructor(mobi) {
@@ -977,6 +1188,13 @@ class KF8 {
             this.#tables.fdstTable = fdstTable
             this.#fullRawLength = fdstTable[fdstTable.length - 1][1]
         } catch {}
+
+        this.#rawCache = new KF8RawCache({
+            fullLength: this.#fullRawLength,
+            loadRecord: this.mobi.loadText.bind(this.mobi),
+            loadRecords: this.mobi.loadTexts.bind(this.mobi),
+            numTextRecords: this.mobi.headers.palmdoc.numTextRecords,
+        })
 
         const skelTable = (await getIndexData(kf8.skel, loadRecord)).table
             .map(({ name, tagMap }, index) => ({
@@ -1086,10 +1304,22 @@ class KF8 {
             }))
         }
     }
+    async #loadRawResource(resourceType, id) {
+        if (this.#availableResourceLoadSlots > 0)
+            this.#availableResourceLoadSlots--
+        else await new Promise(resolve => this.#resourceLoadWaiters.push(resolve))
+        try {
+            return resourceType === 'flow' ? await this.loadFlow(id)
+                : await this.mobi.loadResource(id - 1)
+        } finally {
+            const next = this.#resourceLoadWaiters.shift()
+            if (next) next()
+            else this.#availableResourceLoadSlots++
+        }
+    }
     async loadResourceBlob(str) {
         const { resourceType, id, type } = parseResourceURI(str)
-        const raw = resourceType === 'flow' ? await this.loadFlow(id)
-            : await this.mobi.loadResource(id - 1)
+        const raw = await this.#loadRawResource(resourceType, id)
         const result = [MIME.XHTML, MIME.HTML, MIME.CSS, MIME.SVG].includes(type)
             ? await this.replaceResources(this.mobi.decode(raw)) : raw
         const detail = { data: result, type }
@@ -1098,51 +1328,38 @@ class KF8 {
         const newData = await event.detail.data
         const newType = await event.detail.type
         const doc = newType === MIME.SVG ? this.parser.parseFromString(newData, newType) : null
-        return [new Blob([newData], { newType }),
+        return [new Blob([newData], { type: newType }),
             // SVG wrappers need to be inlined
             // as browsers don't allow external resources when loading SVG as an image
             doc?.getElementsByTagNameNS('http://www.w3.org/2000/svg', 'image')?.length
                 ? doc.documentElement : null]
     }
-    async loadResource(str) {
-        if (this.#cache.has(str)) return this.#cache.get(str)
-        const [blob, inline] = await this.loadResourceBlob(str)
-        const url = inline ? str : URL.createObjectURL(blob)
-        if (inline) this.#inlineMap.set(url, inline)
-        this.#cache.set(str, url)
-        return url
+    loadResource(str) {
+        if (this.#resourceCache.has(str)) return this.#resourceCache.get(str)
+        const pending = this.loadResourceBlob(str).then(([blob, inline]) => {
+            const url = inline ? str : URL.createObjectURL(blob)
+            if (inline) this.#inlineMap.set(url, inline)
+            else this.#resourceURLs.add(url)
+            return url
+        }).catch(error => {
+            if (this.#resourceCache.get(str) === pending)
+                this.#resourceCache.delete(str)
+            throw error
+        })
+        this.#resourceCache.set(str, pending)
+        return pending
     }
     replaceResources(str) {
         const regex = new RegExp(kindleResourceRegex, 'g')
-        return replaceSeries(str, regex, this.loadResource.bind(this))
+        return replaceConcurrent(str, regex, this.loadResource.bind(this))
     }
     // NOTE: there doesn't seem to be a way to access text randomly?
     // how to know the decompressed size of the records without decompressing?
     // 4096 is just the maximum size
     async loadRaw(start, end) {
-        // here we load either from the front or back until we have reached the
-        // required offsets; at worst you'd have to load half the book at once
-        const distanceHead = end - this.#rawHead.length
-        const distanceEnd = this.#fullRawLength == null ? Infinity
-            : (this.#fullRawLength - this.#rawTail.length) - start
-        // load from the start
-        if (distanceHead < 0 || distanceHead < distanceEnd) {
-            while (this.#rawHead.length < end) {
-                const index = ++this.#lastLoadedHead
-                const data = await this.mobi.loadText(index)
-                this.#rawHead = concatTypedArray(this.#rawHead, data)
-            }
-            return this.#rawHead.slice(start, end)
-        }
-        // load from the end
-        while (this.#fullRawLength - this.#rawTail.length > start) {
-            const index = this.mobi.headers.palmdoc.numTextRecords - 1
-                - (++this.#lastLoadedTail)
-            const data = await this.mobi.loadText(index)
-            this.#rawTail = concatTypedArray(data, this.#rawTail)
-        }
-        const rawTailStart = this.#fullRawLength - this.#rawTail.length
-        return this.#rawTail.slice(start - rawTailStart, end - rawTailStart)
+        // At worst this still reads half the book, but accumulated records stay
+        // chunked so extending the cache never recopies the entire prefix/tail.
+        return this.#rawCache.load(start, end)
     }
     loadFlow(index) {
         if (index < 0xffffffff)
@@ -1173,25 +1390,32 @@ class KF8 {
         const str = await this.loadText(section)
         return this.parser.parseFromString(str, this.#type)
     }
-    async loadSection(section) {
+    loadSection(section) {
         if (this.#cache.has(section)) return this.#cache.get(section)
-        const str = await this.loadText(section)
-        const replaced = await this.replaceResources(str)
+        const pending = (async () => {
+            const str = await this.loadText(section)
+            const replaced = await this.replaceResources(str)
 
-        // by default, type is XHTML; change to HTML if it's not valid XHTML
-        let doc = this.parser.parseFromString(replaced, this.#type)
-        if (doc.querySelector('parsererror') || !doc.documentElement?.namespaceURI) {
-            this.#type = MIME.HTML
-            doc = this.parser.parseFromString(replaced, this.#type)
-        }
-        for (const [url, node] of this.#inlineMap) {
-            for (const el of doc.querySelectorAll(`img[src="${url}"]`))
-                el.replaceWith(node)
-        }
-        const url = URL.createObjectURL(
-            new Blob([this.serializer.serializeToString(doc)], { type: this.#type }))
-        this.#cache.set(section, url)
-        return url
+            // by default, type is XHTML; change to HTML if it's not valid XHTML
+            let doc = this.parser.parseFromString(replaced, this.#type)
+            if (doc.querySelector('parsererror') || !doc.documentElement?.namespaceURI) {
+                this.#type = MIME.HTML
+                doc = this.parser.parseFromString(replaced, this.#type)
+            }
+            for (const [url, node] of this.#inlineMap) {
+                for (const el of doc.querySelectorAll(`img[src="${url}"]`))
+                    el.replaceWith(node.cloneNode(true))
+            }
+            const url = URL.createObjectURL(
+                new Blob([this.serializer.serializeToString(doc)], { type: this.#type }))
+            this.#sectionURLs.add(url)
+            return url
+        })().catch(error => {
+            if (this.#cache.get(section) === pending) this.#cache.delete(section)
+            throw error
+        })
+        this.#cache.set(section, pending)
+        return pending
     }
     getIndexByFID(fid) {
         return this.#sections.findIndex(section =>
@@ -1237,6 +1461,7 @@ class KF8 {
         return /^(?!blob|kindle)\w+:/i.test(uri)
     }
     destroy() {
-        for (const url of this.#cache.values()) URL.revokeObjectURL(url)
+        for (const url of this.#sectionURLs) URL.revokeObjectURL(url)
+        for (const url of this.#resourceURLs) URL.revokeObjectURL(url)
     }
 }

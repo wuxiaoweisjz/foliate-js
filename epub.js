@@ -131,6 +131,29 @@ const replaceSeries = async (str, regex, f) => {
     return str.replace(regex, () => results.shift())
 }
 
+const RESOURCE_LOAD_CONCURRENCY = 8
+
+const mapConcurrent = async (items, f, concurrency = RESOURCE_LOAD_CONCURRENCY) => {
+    const results = Array(items.length)
+    let nextIndex = 0
+    let firstError
+    const worker = async () => {
+        while (!firstError && nextIndex < items.length) {
+            const index = nextIndex++
+            try {
+                results[index] = await f(items[index], index)
+            } catch (error) {
+                if (!firstError || index < firstError.index)
+                    firstError = { index, error }
+            }
+        }
+    }
+    await Promise.all(Array.from(
+        { length: Math.min(concurrency, items.length) }, worker))
+    if (firstError) throw firstError.error
+    return results
+}
+
 const regexEscape = str => str.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&')
 
 const tidy = obj => {
@@ -772,6 +795,8 @@ class Loader {
     #cache = new Map()
     #cacheXHTMLContent = new Map()
     #children = new Map()
+    #dependencies = new Map()
+    #pending = new Map()
     #refCount = new Map()
     eventTarget = new EventTarget()
     constructor({ loadText, loadBlob, resources, entries }) {
@@ -831,6 +856,33 @@ class Loader {
             this.#children.delete(href)
         } else this.#refCount.set(href, count)
     }
+    #addDependency(from, to) {
+        const dependencies = this.#dependencies.get(from)
+        if (dependencies)
+            dependencies.set(to, (dependencies.get(to) ?? 0) + 1)
+        else this.#dependencies.set(from, new Map([[to, 1]]))
+    }
+    #removeDependency(from, to) {
+        const dependencies = this.#dependencies.get(from)
+        const count = dependencies?.get(to)
+        if (!count) return
+        if (count > 1) dependencies.set(to, count - 1)
+        else dependencies.delete(to)
+        if (!dependencies.size) this.#dependencies.delete(from)
+    }
+    #hasDependencyPath(from, to) {
+        const seen = new Set()
+        const stack = [from]
+        while (stack.length) {
+            const current = stack.pop()
+            if (current === to) return true
+            if (seen.has(current)) continue
+            seen.add(current)
+            for (const dependency of this.#dependencies.get(current)?.keys() ?? [])
+                stack.push(dependency)
+        }
+        return false
+    }
     // load manifest item, recursively loading all resources as needed
     async loadItem(item, parents = []) {
         if (!item) return null
@@ -847,16 +899,46 @@ class Loader {
         const parent = parents.at(-1)
         if (this.#cache.has(href)) return this.ref(href, parent)
 
+        const isAcyclic = parents.every(p => p !== href)
+        const tracksDependency = isAcyclic && parent && this.#pending.has(parent)
+        const closesDependencyCycle = tracksDependency
+            && this.#hasDependencyPath(href, parent)
+        const canShare = isAcyclic && !closesDependencyCycle
+        const pending = canShare ? this.#pending.get(href) : null
+        if (pending) {
+            if (tracksDependency) this.#addDependency(parent, href)
+            try {
+                const url = await pending
+                return url && this.#cache.has(href)
+                    ? this.ref(href, parent) : url
+            } finally {
+                if (tracksDependency) this.#removeDependency(parent, href)
+            }
+        }
+
         const shouldReplace =
             (isScript || [MIME.XHTML, MIME.HTML, MIME.CSS, MIME.SVG].includes(mediaType))
-            // prevent circular references
-            && parents.every(p => p !== href)
-        if (shouldReplace) return this.loadReplaced(item, parents)
-        // NOTE: this can be replaced with `Promise.try()`
-        const tryLoadBlob = Promise.resolve().then(() => this.loadBlob(href))
-        return this.createURL(href, tryLoadBlob, mediaType, parent)
+            // prevent direct and concurrent circular references
+            && canShare
+        const load = shouldReplace
+            ? this.loadReplaced(item, parents)
+            // NOTE: this can be replaced with `Promise.try()`
+            : this.createURL(href,
+                Promise.resolve().then(() => this.loadBlob(href)),
+                mediaType, parent)
+        if (!canShare) return load
+        this.#pending.set(href, load)
+        if (tracksDependency) this.#addDependency(parent, href)
+        try {
+            return await load
+        } finally {
+            if (tracksDependency) this.#removeDependency(parent, href)
+            if (this.#pending.get(href) === load) this.#pending.delete(href)
+        }
     }
     async loadItemXHTMLContent(item, parents = []) {
+        const cachedURL = item ? this.#cache.get(item.href) : null
+        if (cachedURL) return this.#cacheXHTMLContent.get(cachedURL)?.data
         const url = await this.loadItem(item, parents)
         if (url) return this.#cacheXHTMLContent.get(url)?.data
     }
@@ -945,28 +1027,58 @@ class Loader {
                     child = child.nextSibling
                 }
             }
+            // Compute independent resource replacements concurrently, then
+            // commit them in the same order as the previous serial passes.
+            const replacements = []
+            const queueAttribute = (selector, attr) => {
+                for (const el of doc.querySelectorAll(selector)) {
+                    const value = el.getAttribute(attr)
+                    replacements.push(async () => {
+                        const replaced = await this.loadHref(value, href, parents)
+                        return () => el.setAttribute(attr, replaced)
+                    })
+                }
+            }
             // replace hrefs (excluding anchors)
-            const replace = async (el, attr) => el.setAttribute(attr,
-                await this.loadHref(el.getAttribute(attr), href, parents))
-            for (const el of doc.querySelectorAll('link[href]')) await replace(el, 'href')
-            for (const el of doc.querySelectorAll('[src]')) await replace(el, 'src')
-            for (const el of doc.querySelectorAll('[poster]')) await replace(el, 'poster')
-            for (const el of doc.querySelectorAll('object[data]')) await replace(el, 'data')
-            for (const el of doc.querySelectorAll('[*|href]:not([href])'))
-                el.setAttributeNS(NS.XLINK, 'href', await this.loadHref(
-                    el.getAttributeNS(NS.XLINK, 'href'), href, parents))
-            for (const el of doc.querySelectorAll('[srcset]'))
-                el.setAttribute('srcset', await replaceSeries(el.getAttribute('srcset'),
-                    /(\s*)(.+?)\s*((?:\s[\d.]+[wx])+\s*(?:,|$)|,\s+|$)/g,
-                    (_, p1, p2, p3) => this.loadHref(p2, href, parents)
-                        .then(p2 => `${p1}${p2}${p3}`)))
+            queueAttribute('link[href]', 'href')
+            queueAttribute('[src]', 'src')
+            queueAttribute('[poster]', 'poster')
+            queueAttribute('object[data]', 'data')
+            for (const el of doc.querySelectorAll('[*|href]:not([href])')) {
+                const value = el.getAttributeNS(NS.XLINK, 'href')
+                replacements.push(async () => {
+                    const replaced = await this.loadHref(value, href, parents)
+                    return () => el.setAttributeNS(NS.XLINK, 'href', replaced)
+                })
+            }
+            for (const el of doc.querySelectorAll('[srcset]')) {
+                const value = el.getAttribute('srcset')
+                replacements.push(async () => {
+                    const replaced = await replaceSeries(value,
+                        /(\s*)(.+?)\s*((?:\s[\d.]+[wx])+\s*(?:,|$)|,\s+|$)/g,
+                        (_, p1, p2, p3) => this.loadHref(p2, href, parents)
+                            .then(p2 => `${p1}${p2}${p3}`))
+                    return () => el.setAttribute('srcset', replaced)
+                })
+            }
             // replace inline styles
-            for (const el of doc.querySelectorAll('style'))
-                if (el.textContent) el.textContent =
-                    await this.replaceCSS(el.textContent, href, parents)
-            for (const el of doc.querySelectorAll('[style]'))
-                el.setAttribute('style',
-                    await this.replaceCSS(el.getAttribute('style'), href, parents))
+            for (const el of doc.querySelectorAll('style')) {
+                const value = el.textContent
+                if (value) replacements.push(async () => {
+                    const replaced = await this.replaceCSS(value, href, parents)
+                    return () => { el.textContent = replaced }
+                })
+            }
+            for (const el of doc.querySelectorAll('[style]')) {
+                const value = el.getAttribute('style')
+                replacements.push(async () => {
+                    const replaced = await this.replaceCSS(value, href, parents)
+                    return () => el.setAttribute('style', replaced)
+                })
+            }
+            const applyReplacements = await mapConcurrent(
+                replacements, replace => replace())
+            for (const apply of applyReplacements) apply()
             // TODO: replace inline scripts? probably not worth the trouble
             const result = new XMLSerializer().serializeToString(doc)
             return this.createURL(href, result, item.mediaType, parent)

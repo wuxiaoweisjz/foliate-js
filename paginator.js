@@ -1,4 +1,114 @@
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
+const LOAD_EVENT_WAIT_TIMEOUT_MS = 5000
+const PREPARE_RELOCATE_WAIT_TIMEOUT_MS = 200
+const SECTION_LOAD_TIMEOUT_MS = 5000
+const IFRAME_LOAD_TIMEOUT_MS = 10000
+
+const withTimeout = (task, timeoutMs, label) => {
+    let timeout
+    const pending = Promise.resolve(task)
+    void pending.catch(() => {})
+    return Promise.race([
+        pending,
+        new Promise((_, reject) => {
+            timeout = setTimeout(() => reject(
+                new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs)
+        }),
+    ]).finally(() => clearTimeout(timeout))
+}
+
+const waitForAnimationFrame = () => new Promise(resolve => {
+    let settled = false
+    const finish = () => {
+        if (settled) return
+        settled = true
+        clearTimeout(timeout)
+        resolve()
+    }
+    const timeout = setTimeout(finish, 32)
+    requestAnimationFrame(finish)
+})
+
+const dispatchExtendableLoadEvent = async (target, detail) => {
+    const pending = []
+    const extendedDetail = {
+        ...detail,
+        waitUntil: task => {
+            if (task?.then) pending.push(Promise.resolve(task))
+        },
+    }
+    target.dispatchEvent(new CustomEvent('load', { detail: extendedDetail }))
+    if (pending.length) {
+        let timeout
+        await Promise.race([
+            Promise.allSettled(pending),
+            new Promise(resolve => {
+                timeout = setTimeout(resolve, LOAD_EVENT_WAIT_TIMEOUT_MS)
+            }),
+        ])
+        clearTimeout(timeout)
+    }
+}
+
+const dispatchExtendablePrepareRelocateEvent = (target, detail, controller) => {
+    const pending = []
+    let accepting = true
+    const extendedDetail = {
+        ...detail,
+        signal: controller.signal,
+        waitUntil: task => {
+            if (accepting && task?.then) pending.push(Promise.resolve(task))
+        },
+    }
+    target.dispatchEvent(new CustomEvent('prepare-relocate', {
+        detail: extendedDetail,
+    }))
+    accepting = false
+    if (!pending.length) return
+
+    let readyResolve
+    let abortedResolve
+    let readyDone = false
+    let timeout
+    const ready = new Promise(resolve => { readyResolve = resolve })
+    const aborted = new Promise(resolve => { abortedResolve = resolve })
+    const all = Promise.all(pending)
+    const settled = Promise.race([
+        all.then(() => true, () => false),
+        aborted,
+    ])
+    const onAbort = () => {
+        if (!readyDone) {
+            readyDone = true
+            clearTimeout(timeout)
+            readyResolve(false)
+        }
+        abortedResolve(false)
+        controller.signal.removeEventListener('abort', onAbort)
+    }
+    const resolveReady = (value, keepAbortListener = false) => {
+        if (readyDone) return
+        readyDone = true
+        clearTimeout(timeout)
+        if (!keepAbortListener)
+            controller.signal.removeEventListener('abort', onAbort)
+        readyResolve(value)
+    }
+    timeout = setTimeout(() => resolveReady(
+        false, true), PREPARE_RELOCATE_WAIT_TIMEOUT_MS)
+    controller.signal.addEventListener('abort', onAbort, { once: true })
+    void all.then(
+        () => {
+            controller.signal.removeEventListener('abort', onAbort)
+            resolveReady(true)
+        },
+        () => {
+            controller.abort()
+            resolveReady(false)
+        },
+    )
+    return { ready, settled }
+}
 
 const debounce = (f, wait, immediate) => {
     let timeout
@@ -17,16 +127,18 @@ const debounce = (f, wait, immediate) => {
 // Transforms ALL children of the container so multi-view layouts
 // animate as a unified whole. Extra elements (e.g. background) are
 // also transformed so they slide in sync with the content.
-const animateScroll = (element, scrollProp, startValue, endValue, duration, extraElements = []) => new Promise(resolve => {
+const animateScroll = (element, scrollProp, startValue, endValue, duration,
+    extraElements = [], signal) => new Promise(resolve => {
+    if (signal?.aborted) return resolve(false)
     if (document.hidden) {
         element[scrollProp] = endValue
-        return resolve()
+        return resolve(true)
     }
 
     const children = [...element.children]
     if (!children.length) {
         element[scrollProp] = endValue
-        return resolve()
+        return resolve(true)
     }
 
     const allElements = [...children, ...extraElements]
@@ -50,10 +162,15 @@ const animateScroll = (element, scrollProp, startValue, endValue, duration, extr
         el.style.transform = `${transformProp}(${-delta}px)`
     }
 
+    const first = children[0]
     let resolved = false
-    const cleanup = () => {
+    let timeout
+    const cleanup = commit => {
         if (resolved) return
         resolved = true
+        clearTimeout(timeout)
+        first.removeEventListener('transitionend', onTransitionEnd)
+        signal?.removeEventListener('abort', onAbort)
 
         for (const el of allElements) {
             el.style.willChange = ''
@@ -61,23 +178,23 @@ const animateScroll = (element, scrollProp, startValue, endValue, duration, extr
             el.style.transition = ''
         }
 
-        // Apply final scroll position
-        element[scrollProp] = endValue
-        resolve()
+        const committed = commit && !signal?.aborted
+        if (committed) element[scrollProp] = endValue
+        resolve(committed)
     }
 
     // Listen for transition end on the first child
-    const first = children[0]
     const onTransitionEnd = (e) => {
         if (e.target === first && e.propertyName === 'transform') {
-            first.removeEventListener('transitionend', onTransitionEnd)
-            cleanup()
+            cleanup(true)
         }
     }
+    const onAbort = () => cleanup(false)
     first.addEventListener('transitionend', onTransitionEnd)
+    signal?.addEventListener('abort', onAbort, { once: true })
 
     // Fallback timeout in case transitionend doesn't fire
-    setTimeout(cleanup, duration + 50)
+    timeout = setTimeout(() => cleanup(true), duration + 50)
 })
 
 // collapsed range doesn't return client rects sometimes (or always?)
@@ -196,6 +313,27 @@ const getVisibleRange = (doc, start, end, mapRect) => {
     return range
 }
 
+const snapshotPreparedContents = contents => contents.map(content => {
+    try {
+        return { ...content, text: content.range.toString() }
+    } catch {
+        return { ...content, text: null }
+    }
+})
+
+const isPreparedRangeCurrent = ({ doc, range, text }) => {
+    if (text == null || range.collapsed) return false
+    const { startContainer, endContainer } = range
+    const isCurrentNode = node => node === doc
+        || (node.ownerDocument === doc && doc.documentElement?.contains(node))
+    if (!isCurrentNode(startContainer) || !isCurrentNode(endContainer)) return false
+    try {
+        return range.toString() === text
+    } catch {
+        return false
+    }
+}
+
 const selectionIsBackward = sel => {
     const range = document.createRange()
     range.setStart(sel.anchorNode, sel.anchorOffset)
@@ -281,6 +419,14 @@ const setStylesImportant = (el, styles) => {
     for (const [k, v] of Object.entries(styles)) style.setProperty(k, v, 'important')
 }
 
+const layoutsEqual = (a, b) => {
+    if (a === b) return true
+    if (!a || !b) return false
+    const keys = Object.keys(a)
+    return keys.length === Object.keys(b).length
+        && keys.every(key => a[key] === b[key])
+}
+
 class View {
     #observer = new ResizeObserver(() => this.expand())
     #element = document.createElement('div')
@@ -295,6 +441,9 @@ class View {
     #layout = {}
     #contentPages = 0
     #bgImageSize = null
+    #loadGeneration = 0
+    #cancelPendingLoad = null
+    ready = true
     fontReady = Promise.resolve()
     constructor({ container, onExpand }) {
         this.container = container
@@ -331,56 +480,118 @@ class View {
     get contentPages() {
         return this.#contentPages
     }
-    async load(src, data, afterLoad, beforeRender) {
+    markPending() {
+        this.ready = false
+        Object.assign(this.#element.style, {
+            position: 'absolute',
+            inset: '0',
+            visibility: 'hidden',
+            pointerEvents: 'none',
+        })
+    }
+    markReady({ expand = true } = {}) {
+        if (this.ready) return
+        this.ready = true
+        Object.assign(this.#element.style, {
+            position: 'relative',
+            inset: '',
+            visibility: '',
+            pointerEvents: '',
+        })
+        if (expand) this.expand()
+    }
+    async load(src, data, afterLoad, beforeRender, afterRender) {
         if (typeof src !== 'string') throw new Error(`${src} is not string`)
-        return new Promise(resolve => {
-            this.#iframe.addEventListener('load', () => {
-                const doc = this.document
-                afterLoad?.(doc)
+        const loadGeneration = ++this.#loadGeneration
+        return new Promise((resolve, reject) => {
+            let settled = false
+            let timeout
+            const finish = (committed, error) => {
+                if (settled) return
+                settled = true
+                clearTimeout(timeout)
+                this.#iframe.removeEventListener('load', onLoad)
+                if (this.#cancelPendingLoad === cancel) this.#cancelPendingLoad = null
+                if (error) reject(error)
+                else resolve(committed)
+            }
+            const cancel = () => {
+                if (loadGeneration === this.#loadGeneration) this.#loadGeneration++
+                finish(false)
+            }
+            const onLoad = async () => {
+                try {
+                    const doc = this.document
+                    await afterLoad?.(doc)
+                    if (loadGeneration !== this.#loadGeneration) return finish(false)
 
-                this.#iframe.setAttribute('aria-label', doc.title)
-                // it needs to be visible for Firefox to get computed style
-                this.#iframe.style.display = 'block'
-                const { vertical, rtl } = getDirection(doc)
-                this.docBackground = getBackground(doc)
-                doc.body.style.background = 'none'
-                // Preload background image to get natural dimensions;
-                // in scrolled mode the view expands to fit the image.
-                const bgUrl = this.docBackground
-                    ?.match(/url\(["']?([^"')]+)["']?\)/)?.[1]
-                if (bgUrl && !this.container.noBackground) {
-                    const img = new Image()
-                    img.onload = () => {
-                        this.#bgImageSize = {
-                            width: img.naturalWidth,
-                            height: img.naturalHeight,
+                    this.#iframe.setAttribute('aria-label', doc.title)
+                    // it needs to be visible for Firefox to get computed style
+                    this.#iframe.style.display = 'block'
+                    const { vertical, rtl } = getDirection(doc)
+                    this.docBackground = getBackground(doc)
+                    doc.body.style.background = 'none'
+                    // Preload background image to get natural dimensions;
+                    // in scrolled mode the view expands to fit the image.
+                    const bgUrl = this.docBackground
+                        ?.match(/url\(["']?([^"')]+)["']?\)/)?.[1]
+                    if (bgUrl && !this.container.noBackground) {
+                        const img = new Image()
+                        img.onload = () => {
+                            if (loadGeneration !== this.#loadGeneration) return
+                            this.#bgImageSize = {
+                                width: img.naturalWidth,
+                                height: img.naturalHeight,
+                            }
+                            if (!this.#column) this.expand()
                         }
-                        if (!this.#column) this.expand()
+                        img.src = bgUrl
                     }
-                    img.src = bgUrl
+                    this.#iframe.style.display = 'none'
+
+                    this.#vertical = vertical
+                    this.#rtl = rtl
+
+                    this.#contentRange.selectNodeContents(doc.body)
+                    let layout
+                    try {
+                        layout = beforeRender?.({ vertical, rtl })
+                        this.#iframe.style.display = 'block'
+                        this.render(layout)
+                    } finally {
+                        afterRender?.()
+                    }
+                    this.#observer.observe(doc.body)
+
+                    // the resize observer above doesn't work in Firefox
+                    // (see https://bugzilla.mozilla.org/show_bug.cgi?id=1832939)
+                    // until the bug is fixed we can at least account for font load
+                    this.fontReady = doc.fonts.ready.then(() => {
+                        if (loadGeneration === this.#loadGeneration) this.expand()
+                    })
+
+                    finish(true)
+                } catch (error) {
+                    if (loadGeneration !== this.#loadGeneration) finish(false)
+                    else finish(false, error)
                 }
-                this.#iframe.style.display = 'none'
-
-                this.#vertical = vertical
-                this.#rtl = rtl
-
-                this.#contentRange.selectNodeContents(doc.body)
-                const layout = beforeRender?.({ vertical, rtl })
-                this.#iframe.style.display = 'block'
-                this.render(layout)
-                this.#observer.observe(doc.body)
-
-                // the resize observer above doesn't work in Firefox
-                // (see https://bugzilla.mozilla.org/show_bug.cgi?id=1832939)
-                // until the bug is fixed we can at least account for font load
-                this.fontReady = doc.fonts.ready.then(() => this.expand())
-
-                resolve()
-            }, { once: true })
-            if (data) {
-                this.#iframe.srcdoc = data
-            } else {
-                this.#iframe.src = src
+            }
+            this.#cancelPendingLoad?.()
+            this.#cancelPendingLoad = cancel
+            this.#iframe.addEventListener('load', onLoad, { once: true })
+            timeout = setTimeout(() => {
+                if (loadGeneration === this.#loadGeneration) this.#loadGeneration++
+                finish(false, new Error(
+                    `Iframe load timed out after ${IFRAME_LOAD_TIMEOUT_MS}ms`))
+            }, IFRAME_LOAD_TIMEOUT_MS)
+            try {
+                if (data) {
+                    this.#iframe.srcdoc = data
+                } else {
+                    this.#iframe.src = src
+                }
+            } catch (error) {
+                finish(false, error)
             }
         })
     }
@@ -776,6 +987,9 @@ class View {
             this.#overlayer.clearHole()
     }
     destroy() {
+        this.#cancelPendingLoad?.()
+        this.#cancelPendingLoad = null
+        this.#loadGeneration++
         if (this.document?.body) this.#observer.unobserve(this.document.body)
         this.destroyLoupe()
     }
@@ -816,6 +1030,18 @@ export class Paginator extends HTMLElement {
     #isAnimating = false
     #filling = false // true while #fillVisibleArea is running
     #fillPromise = null // tracks in-progress #fillVisibleArea for awaiting
+    #sectionLoadPromises = new Map() // section index -> in-progress adjacent load
+    #lifecycleGeneration = 0
+    #relocationGeneration = 0
+    #prepareRelocateController = null
+    #preparingRelocation = false
+    #scrollAnimationController = null
+    #scrollAnimationGeneration = 0
+    #navigationGeneration = 0
+    #goToRequestGeneration = 0
+    #latestValidGoToRequest = 0
+    #directNavigationPromises = new Map()
+    #disposed = false
     #stabilizing = false // true while #display is stabilizing layout
     #rendered = false // true after first #display completes
     #lastLayout = null // cached layout from the last #beforeRender call
@@ -1091,7 +1317,9 @@ export class Paginator extends HTMLElement {
         return this.#views.get(this.#primaryIndex)
     }
     get #sortedViews() {
-        return [...this.#views.entries()].sort(([a], [b]) => a - b)
+        return [...this.#views.entries()]
+            .filter(([, view]) => view.ready)
+            .sort(([a], [b]) => a - b)
     }
     get primaryIndex() {
         return this.#primaryIndex
@@ -1120,6 +1348,7 @@ export class Paginator extends HTMLElement {
     attributeChangedCallback(name, _, value) {
         switch (name) {
             case 'flow':
+                this.#cancelPreparedRelocation()
                 this.render()
                 break
             case 'gap':
@@ -1147,6 +1376,12 @@ export class Paginator extends HTMLElement {
         }
     }
     open(book) {
+        this.#cancelPreparedRelocation()
+        this.#disposed = false
+        this.#lifecycleGeneration++
+        this.#navigationGeneration++
+        this.#sectionLoadPromises.clear()
+        this.#directNavigationPromises.clear()
         this.bookDir = book.dir
         this.sections = book.sections
         book.transformTarget?.addEventListener('data', ({ detail }) => {
@@ -1161,7 +1396,7 @@ export class Paginator extends HTMLElement {
                     `break-${x}: ${y ?? ''}column`))
         })
     }
-    #createView(index) {
+    #createView(index, pending = false) {
         // Destroy existing view for this index if any
         const existing = this.#views.get(index)
         if (existing) {
@@ -1174,13 +1409,15 @@ export class Paginator extends HTMLElement {
             onExpand: () => {
                 // Only the primary view's resize should adjust scroll;
                 // non-primary views (preloaded/adjacent) must not scroll
-                if (this.#filling || this.#stabilizing || this.scrolled) return
+                if (this.#filling || this.#stabilizing
+                    || this.#preparingRelocation || this.scrolled) return
                 if (this.#primaryIndex === index)
                     this.#scrollToAnchor(this.#anchor)
             },
         })
+        if (pending) view.markPending()
         this.#views.set(index, view)
-        const sorted = this.#sortedViews
+        const sorted = [...this.#views.entries()].sort(([a], [b]) => a - b)
         const myPos = sorted.findIndex(([i]) => i === index)
         const nextEntry = sorted[myPos + 1]
         if (nextEntry) this.#container.insertBefore(view.element, nextEntry[1].element)
@@ -1202,6 +1439,10 @@ export class Paginator extends HTMLElement {
     #syncA11y() {
         const containerRect = this.#container.getBoundingClientRect()
         for (const [index, view] of this.#views) {
+            if (!view.ready) {
+                view.element.setAttribute('aria-hidden', 'true')
+                continue
+            }
             const isPrimary = index === this.#primaryIndex
             const isVisible = isPrimary
                 || isViewVisibleInContainer(
@@ -1318,12 +1559,12 @@ export class Paginator extends HTMLElement {
             this.#background.appendChild(col)
         }
     }
-    #beforeRender({ vertical, rtl }) {
+    #beforeRender({ vertical, rtl }, { preserveViews = false } = {}) {
         // If writing-mode is about to change, destroy all non-primary
         // views BEFORE updating global state. This prevents stale views
         // with the wrong direction from remaining in the container while
         // flex-direction / scrollProp / sideProp flip.
-        if (this.#rendered && vertical !== this.#vertical) {
+        if (!preserveViews && this.#rendered && vertical !== this.#vertical) {
             for (const [i] of this.#views) {
                 if (i !== this.#primaryIndex) this.#destroyView(i)
             }
@@ -1511,7 +1752,7 @@ export class Paginator extends HTMLElement {
     get #renderedViewSize() {
         if (this.#views.size === 0) return 0
         let total = 0
-        for (const [, view] of this.#views)
+        for (const [, view] of this.#sortedViews)
             total += view.element.getBoundingClientRect()[this.sideProp]
         return total
     }
@@ -1548,6 +1789,7 @@ export class Paginator extends HTMLElement {
     // dx, dy: total distance swiped
     // dt: total time of the swipe (ms)
     snap(vx, vy, dx, dy, dt) {
+        if (this.#disposed) return
         const velocity = this.#vertical ? vy : vx
         const avgVelocity = this.#vertical ? dy / dt : dx / dt
         const horizontal = Math.abs(vx) * 2 > Math.abs(vy)
@@ -1571,9 +1813,21 @@ export class Paginator extends HTMLElement {
             const edgeIndex = dir < 0
                 ? sorted[0]?.[0] ?? this.#primaryIndex
                 : sorted[sorted.length - 1]?.[0] ?? this.#primaryIndex
-            return this.#goTo({
-                index: this.#adjacentIndex(dir, edgeIndex),
+            const index = this.#adjacentIndex(dir, edgeIndex)
+            if (index == null) return
+            const lifecycleGeneration = this.#lifecycleGeneration
+            this.#cancelPreparedRelocation()
+            const navigationGeneration = ++this.#navigationGeneration
+            const task = this.#goTo({
+                index,
                 anchor: dir < 0 ? () => 1 : () => 0,
+                reason: 'snap',
+            }, navigationGeneration, lifecycleGeneration)
+            const directNavigation = { navigationGeneration, task, kind: 'snap' }
+            this.#directNavigationPromises.set(index, directNavigation)
+            return task.finally(() => {
+                if (this.#directNavigationPromises.get(index) === directNavigation)
+                    this.#directNavigationPromises.delete(index)
             })
         }
         // Out of range — skip animation, go straight to adjacent section
@@ -1650,7 +1904,10 @@ export class Paginator extends HTMLElement {
         // XXX: Firefox seems to report scale as 1... sometimes...?
         // at this point I'm basically throwing `requestAnimationFrame` at
         // anything that doesn't work
+        const lifecycleGeneration = this.#lifecycleGeneration
         requestAnimationFrame(() => {
+            if (this.#disposed
+                || lifecycleGeneration !== this.#lifecycleGeneration) return
             if (globalThis.visualViewport.scale === 1) {
                 const { vx, vy, dx, dy, dt } = this.#touchState
                 this.snap(vx, vy, dx, dy, dt)
@@ -1658,45 +1915,71 @@ export class Paginator extends HTMLElement {
         })
     }
     // allows one to process rects as if they were LTR and horizontal
-    #getRectMapper(view) {
+    #getRectMapper(view, direction = {}) {
+        const vertical = direction.vertical ?? this.#vertical
+        const rtl = direction.rtl ?? this.#rtl
+        const sideProp = vertical
+            ? (this.scrolled ? 'width' : 'height')
+            : (this.scrolled ? 'height' : 'width')
         if (this.scrolled) {
-            const size = view ? view.element.getBoundingClientRect()[this.sideProp] : this.#renderedViewSize
+            const size = view
+                ? view.element.getBoundingClientRect()[sideProp]
+                : this.#renderedViewSize
             const marginTop = this.#marginTop
             const marginBottom = this.#marginBottom
-            return this.#vertical
+            return vertical
                 ? ({ left, right }) =>
                     ({ left: size - right - marginTop, right: size - left - marginBottom })
                 : ({ top, bottom }) => ({ left: top - marginTop, right: bottom - marginBottom })
         }
-        const pxSize = this.#renderedPages * this.size
-        return this.#rtl
+        const pxSize = view
+            ? view.element.getBoundingClientRect()[sideProp]
+            : this.#renderedPages * this.size
+        return rtl
             ? ({ left, right }) =>
                 ({ left: pxSize - right, right: pxSize - left })
-            : this.#vertical
+            : vertical
                 ? ({ top, bottom }) => ({ left: top, right: bottom })
                 : f => f
     }
-    async #scrollToRect(rect, reason) {
+    async #scrollToRect(rect, reason, preparedContents,
+        primaryIndex = this.#primaryIndex, prepareRelocation = false,
+        beforeCommit) {
+        const primaryView = this.#views.get(primaryIndex)
         if (this.scrolled) {
             // rect is in iframe-local coordinates; add view offset
             // to convert to container scroll coordinates
-            const localOffset = this.#getRectMapper()(rect).left - 3
-            const viewOffset = this.#getViewOffset(this.#primaryIndex)
-            return this.#scrollTo(viewOffset + localOffset, reason)
+            const localOffset = this.#getRectMapper(primaryView)(rect).left - 3
+            const viewOffset = this.#getViewOffset(primaryIndex)
+            return this.#scrollToScrolledOffset(
+                viewOffset + localOffset,
+                reason,
+                false,
+                preparedContents,
+                primaryIndex,
+                prepareRelocation,
+                beforeCommit,
+            )
         }
         // rect is in iframe-local coordinates. Convert to container
         // coordinates by adding the primary view's offset.
-        const localOffset = this.#getRectMapper()(rect).left
-        const viewOffset = this.#getViewOffset(this.#primaryIndex)
+        const localOffset = this.#getRectMapper(primaryView)(rect).left
+        const viewOffset = this.#getViewOffset(primaryIndex)
         const containerOffset = viewOffset + localOffset
-        return this.#scrollToPage(Math.floor(containerOffset / this.size + 0.01), reason)
+        return this.#scrollToPage(Math.floor(containerOffset / this.size + 0.01),
+            reason, false, preparedContents, primaryIndex,
+            prepareRelocation, beforeCommit)
     }
-    async #scrollTo(offset, reason, smooth) {
+    async #scrollTo(offset, reason, smooth, preparedContents, primaryIndex) {
+        this.#scrollAnimationController?.abort()
+        this.#scrollAnimationController = null
+        const scrollAnimationGeneration = ++this.#scrollAnimationGeneration
         const { size } = this
         if (this.containerPosition === offset) {
+            this.#isAnimating = false
             this.#scrollBounds = [offset, this.atStart ? 0 : size, this.atEnd ? 0 : size]
-            this.#afterScroll(reason)
-            return
+            this.#afterScroll(reason, preparedContents, primaryIndex)
+            return true
         }
         // FIXME: vertical-rl only, not -lr
         if (this.scrolled && this.#vertical) offset = -offset
@@ -1706,6 +1989,8 @@ export class Paginator extends HTMLElement {
             // correct when the slide animation reveals the new page
             if (!this.scrolled) this.#replaceBackground(offset)
             // Use GPU-accelerated scroll animation for smoother experience on high refresh rate screens
+            const controller = new AbortController()
+            this.#scrollAnimationController = controller
             this.#isAnimating = true
             return animateScroll(
                 this.#container,
@@ -1713,26 +1998,264 @@ export class Paginator extends HTMLElement {
                 startPosition,
                 offset,
                 300,
-            ).then(() => {
+                [],
+                controller.signal,
+            ).then(committed => {
+                if (this.#scrollAnimationController === controller)
+                    this.#scrollAnimationController = null
+                if (scrollAnimationGeneration !== this.#scrollAnimationGeneration) return
                 this.#isAnimating = false
+                if (!committed) return false
                 this.#scrollBounds = [offset, this.atStart ? 0 : size, this.atEnd ? 0 : size]
-                this.#afterScroll(reason)
+                this.#afterScroll(reason, preparedContents, primaryIndex)
+                return true
             })
         } else {
+            this.#isAnimating = false
             this.containerPosition = offset
             this.#scrollBounds = [offset, this.atStart ? 0 : size, this.atEnd ? 0 : size]
-            this.#afterScroll(reason)
+            this.#afterScroll(reason, preparedContents, primaryIndex)
+            return true
         }
     }
-    async #scrollToPage(page, reason, smooth) {
+    #scrollToScrolledOffset(offset, reason, smooth, preparedContents,
+        primaryIndex, prepareRelocation = false, beforeCommit) {
+        this.#cancelPreparedRelocation()
+        if (preparedContents !== undefined) {
+            beforeCommit?.()
+            return this.#scrollTo(
+                offset, reason, smooth, preparedContents, primaryIndex)
+        }
+        const changesPrimary = primaryIndex != null
+            && primaryIndex !== this.#primaryIndex
+        if (!prepareRelocation
+            || (this.#renderedStart === Math.abs(offset) && !changesPrimary)) {
+            beforeCommit?.()
+            return this.#scrollTo(offset, reason, smooth, undefined, primaryIndex)
+        }
+
+        const lifecycleGeneration = this.#lifecycleGeneration
+        const navigationGeneration = this.#navigationGeneration
+        const relocationGeneration = this.#relocationGeneration
+        const prepare = () => {
+            if (this.#disposed
+                || lifecycleGeneration !== this.#lifecycleGeneration
+                || navigationGeneration !== this.#navigationGeneration
+                || relocationGeneration !== this.#relocationGeneration) return
+            const controller = new AbortController()
+            this.#prepareRelocateController = controller
+            const maxStart = Math.max(0, this.#renderedViewSize - this.size)
+            const start = Math.max(0, Math.min(Math.abs(offset), maxStart))
+            const contents = this.#getContentsForRenderedWindow(
+                start, start + this.size)
+            const preparedContents = snapshotPreparedContents(contents)
+            const gate = dispatchExtendablePrepareRelocateEvent(
+                this, { contents }, controller)
+            const commit = ready => {
+                if (this.#prepareRelocateController === controller)
+                    this.#preparingRelocation = false
+                if (this.#disposed
+                    || lifecycleGeneration !== this.#lifecycleGeneration
+                    || navigationGeneration !== this.#navigationGeneration
+                    || relocationGeneration !== this.#relocationGeneration) return
+                if (ready === false) {
+                    return gate.settled.then(success => {
+                        if (!success
+                            || this.#prepareRelocateController !== controller
+                            || this.#disposed
+                            || lifecycleGeneration !== this.#lifecycleGeneration
+                            || navigationGeneration !== this.#navigationGeneration
+                            || relocationGeneration !== this.#relocationGeneration) return false
+                        return this.#scrollToScrolledOffset(
+                            offset,
+                            reason,
+                            smooth,
+                            undefined,
+                            primaryIndex,
+                            prepareRelocation,
+                            beforeCommit,
+                        )
+                    })
+                }
+                beforeCommit?.()
+                return this.#scrollTo(
+                    offset, reason, smooth, preparedContents, primaryIndex)
+            }
+            if (!gate) return commit(true)
+            this.#preparingRelocation = true
+            return gate.ready.then(commit)
+        }
+        return prepare()
+    }
+    #getContentsForRenderedWindow(start, end) {
+        const contents = []
+        let viewOffset = 0
+        for (const [index, view] of this.#sortedViews) {
+            const viewSize = view.element.getBoundingClientRect()[this.sideProp]
+            const viewEnd = viewOffset + viewSize
+            if (viewEnd > start && viewOffset < end && view.document) {
+                const range = getVisibleRange(view.document,
+                    start - viewOffset, end - viewOffset,
+                    this.#getRectMapper(view))
+                if (range && !range.collapsed) contents.push({
+                    doc: view.document,
+                    index,
+                    range,
+                })
+            }
+            viewOffset = viewEnd
+        }
+        return contents
+    }
+    #getContentsForStagedView(index, view, anchor, direction, layout) {
+        if (!view?.document) return []
+        const sideProp = direction.vertical
+            ? (this.scrolled ? 'width' : 'height')
+            : (this.scrolled ? 'height' : 'width')
+        const size = this.#container.getBoundingClientRect()[sideProp]
+        if (!size) return []
+        const mapRect = this.#getRectMapper(view, direction)
+        if (this.scrolled) {
+            const viewSize = view.element.getBoundingClientRect()[sideProp]
+            let start = 0
+            if (typeof anchor === 'number') {
+                start = anchor * viewSize
+            } else {
+                const rects = uncollapse(anchor)?.getClientRects?.()
+                const rect = rects && (Array.from(rects)
+                    .find(r => r.width > 0 && r.height > 0 && r.x >= 0 && r.y >= 0)
+                    || rects[0])
+                if (rect) start = mapRect(rect).left - 3
+            }
+            start = Math.max(0, Math.min(start, Math.max(0, viewSize - size)))
+            const range = getVisibleRange(
+                view.document,
+                start,
+                start + size,
+                mapRect,
+            )
+            return range && !range.collapsed
+                ? [{ doc: view.document, index, range }]
+                : []
+        }
+        const columnCount = layout?.columnCount ?? 1
+        let targetPage = 0
+        if (typeof anchor === 'number') {
+            const targetColumn = Math.round(
+                anchor * Math.max(0, view.contentPages - 1))
+            targetPage = Math.floor(targetColumn / columnCount)
+        } else {
+            const rects = uncollapse(anchor)?.getClientRects?.()
+            const rect = rects && (Array.from(rects)
+                .find(r => r.width > 0 && r.height > 0 && r.x >= 0 && r.y >= 0)
+                || rects[0])
+            if (rect) {
+                const localOffset = mapRect(rect).left
+                targetPage = Math.floor(Math.max(0, localOffset) / size + 0.01)
+            }
+        }
+        const start = targetPage * size
+        const range = getVisibleRange(
+            view.document,
+            start,
+            start + size,
+            mapRect,
+        )
+        return range && !range.collapsed
+            ? [{ doc: view.document, index, range }]
+            : []
+    }
+    #cancelPreparedRelocation() {
+        this.#relocationGeneration++
+        this.#prepareRelocateController?.abort()
+        this.#prepareRelocateController = null
+        this.#scrollAnimationController?.abort()
+        this.#scrollAnimationController = null
+        this.#preparingRelocation = false
+    }
+    #scrollToPage(page, reason, smooth, preparedContents, primaryIndex,
+        prepareRelocation = false, beforeCommit) {
         const offset = this.size * (this.#rtl ? -page : page)
-        return this.#scrollTo(offset, reason, smooth)
+        this.#cancelPreparedRelocation()
+        if (preparedContents !== undefined) {
+            beforeCommit?.()
+            return this.#scrollTo(offset, reason, smooth, preparedContents, primaryIndex)
+        }
+        const changesPrimary = primaryIndex != null
+            && primaryIndex !== this.#primaryIndex
+        if (this.scrolled || (this.containerPosition === offset && !changesPrimary)
+            || (!prepareRelocation && reason !== 'page' && reason !== 'snap')) {
+            beforeCommit?.()
+            return this.#scrollTo(offset, reason, smooth, undefined, primaryIndex)
+        }
+
+        const lifecycleGeneration = this.#lifecycleGeneration
+        const navigationGeneration = this.#navigationGeneration
+        const relocationGeneration = this.#relocationGeneration
+        const prepare = () => {
+            if (this.#disposed
+                || lifecycleGeneration !== this.#lifecycleGeneration
+                || navigationGeneration !== this.#navigationGeneration
+                || relocationGeneration !== this.#relocationGeneration) return
+            const controller = new AbortController()
+            this.#prepareRelocateController = controller
+            const start = Math.abs(offset)
+            const contents = this.#getContentsForRenderedWindow(start, start + this.size)
+            const preparedContents = snapshotPreparedContents(contents)
+            const gate = dispatchExtendablePrepareRelocateEvent(this, { contents }, controller)
+            const commit = ready => {
+                if (this.#prepareRelocateController === controller) {
+                    this.#preparingRelocation = false
+                }
+                if (this.#disposed
+                    || lifecycleGeneration !== this.#lifecycleGeneration
+                    || navigationGeneration !== this.#navigationGeneration
+                    || relocationGeneration !== this.#relocationGeneration) return
+                if (ready === false) {
+                    // Keep the controller alive so a cold highlight task can
+                    // finish without being fenced. Once it settles, retry
+                    // from the still-current navigation generation; the cache
+                    // is then warm and the second prepare normally commits
+                    // synchronously. A cancelled/rejected task does not retry.
+                    const retryWhenSettled = gate.settled.then(success => {
+                        if (!success
+                            || this.#prepareRelocateController !== controller
+                            || this.#disposed
+                            || lifecycleGeneration !== this.#lifecycleGeneration
+                            || navigationGeneration !== this.#navigationGeneration
+                            || relocationGeneration !== this.#relocationGeneration) return false
+                        return this.#scrollToPage(page, reason, smooth,
+                            undefined, primaryIndex, prepareRelocation, beforeCommit)
+                    })
+                    // Direct goTo navigation must remain pending so its anchor,
+                    // focus, trimming and history update stay in the original
+                    // commit chain. Page/snap keeps its bounded-return behavior.
+                    if (prepareRelocation) return retryWhenSettled
+                    void retryWhenSettled
+                    return false
+                }
+                beforeCommit?.()
+                return this.#scrollTo(offset, reason, smooth,
+                    preparedContents, primaryIndex)
+            }
+            if (!gate) return commit(true)
+            this.#preparingRelocation = true
+            return gate.ready.then(commit)
+        }
+        return prepare()
     }
     async scrollToAnchor(anchor, select, smooth) {
         return this.#scrollToAnchor(anchor, select ? 'selection' : 'navigation', smooth)
     }
-    async #scrollToAnchor(anchor, reason = 'anchor', smooth = false) {
-        this.#anchor = anchor
+    async #scrollToAnchor(anchor, reason = 'anchor', smooth = false,
+        preparedContents, primaryIndex = this.#primaryIndex,
+        preserveAnchorUntilCommit = false, prepareRelocation = false) {
+        if (!preserveAnchorUntilCommit) this.#anchor = anchor
+        const beforeCommit = preserveAnchorUntilCommit
+            && (reason === 'navigation' || reason === 'selection'
+                || reason === 'anchor')
+            ? () => { this.#anchor = anchor }
+            : undefined
         const rects = uncollapse(anchor)?.getClientRects?.()
         // if anchor is an element or a range
         if (rects) {
@@ -1741,7 +2264,10 @@ export class Paginator extends HTMLElement {
             const rect = Array.from(rects)
                 .find(r => r.width > 0 && r.height > 0 && r.x >= 0 && r.y >= 0) || rects[0]
             if (!rect) return
-            await this.#scrollToRect(rect, reason)
+            const committed = await this.#scrollToRect(
+                rect, reason, preparedContents, primaryIndex,
+                prepareRelocation, beforeCommit)
+            if (committed === false) return false
             // focus the element when navigating with keyboard or screen reader
             if (reason === 'navigation') {
                 let node = anchor.focus ? anchor : undefined
@@ -1757,28 +2283,38 @@ export class Paginator extends HTMLElement {
                     node.focus({ preventScroll: true })
                 }
             }
-            return
+            return committed
         }
         // if anchor is a fraction
         if (this.scrolled) {
             // In scrolled mode with multi-view, offset to the primary view's position
-            const primaryOffset = this.#getViewOffset(this.#primaryIndex)
-            const primaryView = this.#primaryView
+            const primaryOffset = this.#getViewOffset(primaryIndex)
+            const primaryView = this.#views.get(primaryIndex)
             const primarySize = primaryView
                 ? primaryView.element.getBoundingClientRect()[this.sideProp] : this.#renderedViewSize
-            await this.#scrollTo(primaryOffset + anchor * primarySize, reason, smooth)
-            return
+            return await this.#scrollToScrolledOffset(
+                primaryOffset + anchor * primarySize,
+                reason,
+                smooth,
+                preparedContents,
+                primaryIndex,
+                prepareRelocation,
+                beforeCommit,
+            )
         }
         // In paginated mode, account for pages before the primary section
-        const primaryView = this.#primaryView
+        const primaryView = this.#views.get(primaryIndex)
         if (!primaryView) return
-        const pagesBeforePrimary = this.#getPagesBeforeView(this.#primaryIndex)
+        const pagesBeforePrimary = this.#getPagesBeforeView(primaryIndex)
         const textPages = primaryView.contentPages
         if (!textPages) return
         // textPages is in column units; convert to spread page for scrolling
         const newColumn = Math.round(anchor * (textPages - 1))
         const newSpreadPage = Math.floor(newColumn / this.columnCount)
-        await this.#scrollToPage(pagesBeforePrimary + newSpreadPage, reason, smooth)
+        return await this.#scrollToPage(
+            pagesBeforePrimary + newSpreadPage,
+            reason, smooth, preparedContents, primaryIndex,
+            prepareRelocation, beforeCommit)
     }
     // Get the pixel offset of a view within the container
     #getViewOffset(index) {
@@ -1837,19 +2373,34 @@ export class Paginator extends HTMLElement {
                     this.#syncA11y()
                     this.#trimDistantViews()
                     this.#replaceBackground()
-                    this.#fillPromise = this.#preloadNext()
+                    this.#startFill(() => this.#preloadNext())
                 }
                 return
             }
             offset += viewSize
         }
     }
+    #startFill(start) {
+        if (this.#fillPromise) return this.#fillPromise
+        const task = Promise.resolve().then(start)
+        this.#fillPromise = task
+        const settle = () => {
+            if (this.#fillPromise !== task) return
+            this.#fillPromise = null
+            this.#stabilizing = false
+        }
+        void task.then(settle, error => {
+            console.warn(error)
+            settle()
+        })
+        return task
+    }
     // Pre-load adjacent sections from the current primary so the
     // next/prev sections are ready when the user paginates.
     // Does NOT re-scroll to avoid fighting with the user's current
     // scroll position.
     async #preloadNext() {
-        if (this.noPreload || this.noContinuousScroll) return
+        if (this.noPreload || this.noContinuousScroll || this.#filling) return
         this.#filling = true
         try {
             const { size } = this
@@ -1876,15 +2427,21 @@ export class Paginator extends HTMLElement {
             // Wait a frame so ResizeObserver callbacks fire while
             // #filling is still true, preventing onExpand from
             // re-scrolling to a stale anchor position.
-            await new Promise(r => requestAnimationFrame(r))
+            await waitForAnimationFrame()
         } finally {
             this.#filling = false
             this.dispatchEvent(new Event('stabilized'))
         }
     }
-    #afterScroll(reason) {
+    #afterScroll(reason, preparedContents, primaryIndex) {
         // In multi-view, detect which section is primary
-        if (this.#views.size > 1 && reason !== 'anchor' && reason !== 'navigation') {
+        if (primaryIndex != null && this.#views.get(primaryIndex)?.ready) {
+            if (this.#primaryIndex !== primaryIndex) {
+                this.#primaryIndex = primaryIndex
+                this.#syncA11y()
+            }
+        } else if (this.#views.size > 1
+            && reason !== 'anchor' && reason !== 'navigation') {
             this.#detectPrimaryView()
             // Scrolling can bring a previously off-screen view into the
             // viewport (e.g. the next section's first column joining the
@@ -1893,7 +2450,11 @@ export class Paginator extends HTMLElement {
             // a newly visible view stops being aria-hidden.
             this.#syncA11y()
         }
-        const { range, index: visibleIndex } = this.#getVisibleRange() || {}
+        const prepared = preparedContents
+            ?.find(content => content.index === this.#primaryIndex)
+        const visible = prepared && isPreparedRangeCurrent(prepared)
+            ? prepared : this.#getVisibleRange()
+        const { range, index: visibleIndex } = visible || {}
         if (!range) return
         this.#lastVisibleRange = range
         // don't set new anchor if relocation was to scroll to anchor
@@ -1926,16 +2487,72 @@ export class Paginator extends HTMLElement {
         if (!this.scrolled) this.#replaceBackground()
         this.dispatchEvent(new CustomEvent('relocate', { detail }))
     }
-    async #display(promise) {
+    async #display(promise, navigationGeneration, lifecycleGeneration) {
+        const isCurrent = () => this.#isNavigationCurrent(
+            navigationGeneration, lifecycleGeneration)
+        const previous = {
+            primaryIndex: this.#primaryIndex,
+            hasReadyView: this.#rendered
+                && this.#views.get(this.#primaryIndex)?.ready === true
+                && !!this.#views.get(this.#primaryIndex)?.document,
+            anchor: this.#anchor,
+            vertical: this.#vertical,
+            rtl: this.#rtl,
+            scrollLeft: this.#container.scrollLeft,
+            scrollTop: this.#container.scrollTop,
+            opacity: this.#container.style.opacity || '1',
+        }
+        let createdView
+        let loadingOpacity = previous.opacity
+        const restorePreviousVisualState = () => {
+            if (!isCurrent()) return
+            this.#primaryIndex = this.#views.has(previous.primaryIndex)
+                ? previous.primaryIndex : this.#sortedViews[0]?.[0] ?? -1
+            this.#anchor = previous.anchor
+            if (this.#rendered) {
+                this.#beforeRender({
+                    vertical: previous.vertical,
+                    rtl: previous.rtl,
+                }, { preserveViews: true })
+            }
+            this.#container.scrollLeft = previous.scrollLeft
+            this.#container.scrollTop = previous.scrollTop
+            this.#container.style.opacity = loadingOpacity
+            this.#syncA11y()
+        }
+        const rollback = () => {
+            if (createdView && this.#views.get(createdView.index) === createdView.view)
+                this.#destroyView(createdView.index)
+            if (!isCurrent()) return
+            loadingOpacity = previous.opacity
+            restorePreviousVisualState()
+            this.#preparingRelocation = false
+            this.#stabilizing = false
+        }
         this.#stabilizing = true
-        this.#container.style.opacity = '0'
-        const { index, src, data, anchor, onLoad, select } = await promise
-        this.#primaryIndex = index
-        this.#syncA11y()
-        const hasFocus = this.#primaryView?.document?.hasFocus()
+        let payload
+        try {
+            payload = await promise
+        } catch (error) {
+            rollback()
+            throw error
+        }
+        if (!isCurrent()) return
+        const { index, src, data, anchor, onLoad, select, reason } = payload
+        const relocationReason = reason ?? (select ? 'selection' : 'navigation')
+        const isPreparedDirectNavigation = relocationReason === 'navigation'
+            && previous.hasReadyView
+        const isPreparedRelocation = reason === 'page' || reason === 'snap'
+            || isPreparedDirectNavigation
+        loadingOpacity = isPreparedRelocation ? previous.opacity : '0'
+        this.#container.style.opacity = loadingOpacity
+        const hasFocus = this.#views.get(previous.primaryIndex)?.document?.hasFocus()
+        let targetDirection
+        let targetLayout
         if (src) {
-            const view = this.#createView(index)
-            const afterLoad = doc => {
+            const view = this.#createView(index, true)
+            createdView = { index, view }
+            const afterLoad = async doc => {
                 if (doc.head) {
                     const $styleBefore = doc.createElement('style')
                     doc.head.prepend($styleBefore)
@@ -1945,14 +2562,30 @@ export class Paginator extends HTMLElement {
                         prop => doc.documentElement.setAttribute('data-' + prop, ''))
                     this.#styleMap.set(doc, [$styleBefore, $style])
                 }
-                onLoad?.({ doc, index })
+                await onLoad?.({ doc, index })
             }
-            const beforeRender = this.#beforeRender.bind(this)
-            await view.load(src, data, afterLoad, beforeRender)
-            // Cache direction for future preload boundary checks
+            const beforeRender = direction => {
+                if (!isCurrent()) return
+                targetDirection = direction
+                targetLayout = this.#beforeRender(direction, { preserveViews: true })
+                return targetLayout
+            }
+            const afterRender = () => restorePreviousVisualState()
+            let loaded
+            try {
+                loaded = await view.load(
+                    src, data, afterLoad, beforeRender, afterRender)
+            } catch (error) {
+                rollback()
+                throw error
+            }
+            if (!loaded || !isCurrent() || this.#views.get(index) !== view) {
+                rollback()
+                return
+            }
             if (view.document) {
-                const dir = getDirection(view.document)
-                this.#directionCache.set(index, dir.vertical)
+                targetDirection ??= getDirection(view.document)
+                this.#directionCache.set(index, targetDirection.vertical)
             }
             this.dispatchEvent(new CustomEvent('create-overlayer', {
                 detail: {
@@ -1961,52 +2594,132 @@ export class Paginator extends HTMLElement {
                 },
             }))
         }
-        // Pre-load previous section when needed:
-        // - Short primary alignment (section shorter than one spread)
-        // - Scrolled mode with anchor in top half — so the user can
-        //   scroll backward into the previous section immediately
-        const primaryView = this.#primaryView
-        if (!this.noPreload && !this.noContinuousScroll && primaryView) {
-            const needsPrev = (primaryView.contentPages > 0 && primaryView.contentPages < this.columnCount)
-            if (needsPrev || this.scrolled) {
-                const sorted = this.#sortedViews
-                const firstIndex = sorted[0]?.[0]
-                if (firstIndex != null) {
-                    const prevIdx = this.#adjacentIndex(-1, firstIndex)
-                    if (prevIdx != null && this.#isSameDirection(prevIdx)) {
-                        await this.#loadAdjacentSection(prevIdx)
-                    }
-                }
-            }
+        const targetView = createdView?.view ?? this.#views.get(index)
+        if (!targetView?.document || !targetDirection || !targetLayout) {
+            rollback()
+            return false
         }
         const resolvedAnchor = (typeof anchor === 'function'
-            ? anchor(primaryView.document) : anchor) ?? 0
-        await this.scrollToAnchor(resolvedAnchor, select)
-        if (hasFocus) this.focusView()
-        // Reveal content now that primary section is positioned
-        this.#container.style.opacity = '1'
-        this.#rendered = true
-        // Emit stabilized so listeners can react, but keep #stabilizing
-        // true until fill completes to prevent the debounced scroll
-        // handler from loading backward sections during rapid DOM changes.
-        this.dispatchEvent(new Event('stabilized'))
-        // Load remaining adjacent sections progressively (non-blocking).
-        // In scrolled mode, skip reanchor — browser scroll anchoring
-        // preserves position when content is added above/below.
-        this.#fillPromise = this.#fillVisibleArea(
-            { reanchor: !this.scrolled })
-        this.#fillPromise.then(() => { this.#stabilizing = false })
+            ? anchor(targetView.document) : anchor) ?? 0
+        const commitTarget = async preparedContents => {
+            if (!isCurrent() || this.#views.get(index) !== targetView) return false
+            this.#prepareRelocateController = null
+            this.#preparingRelocation = false
+            this.#stabilizing = true
+            this.#primaryIndex = index
+            const stagedLayout = targetLayout
+            targetLayout = this.#beforeRender(targetDirection, { preserveViews: true })
+            const layoutChanged = !layoutsEqual(stagedLayout, targetLayout)
+            if (layoutChanged) targetView.render(targetLayout)
+            // The pending view was already rendered with stagedLayout. When
+            // it is unchanged, only recompute its extent after highlight DOM
+            // insertion; when it changed, render() already expanded it.
+            targetView.markReady({ expand: !layoutChanged })
+            const canKeepNearbyViews = targetDirection.vertical === previous.vertical
+                && !this.noContinuousScroll
+            for (const [viewIndex] of this.#views) {
+                if (viewIndex === index) continue
+                if (canKeepNearbyViews && Math.abs(viewIndex - index) <= 2) continue
+                this.#destroyView(viewIndex)
+            }
+            this.#syncA11y()
+            const positioned = await this.#scrollToAnchor(
+                resolvedAnchor,
+                relocationReason,
+                false,
+                preparedContents,
+                index,
+            )
+            if (!isCurrent()) return false
+            if (positioned === false) return false
+            if (hasFocus) this.focusView()
+            this.#container.style.opacity = '1'
+            this.#rendered = true
+            this.dispatchEvent(new Event('stabilized'))
+            this.#startFill(() => this.#fillVisibleArea(
+                { reanchor: !this.scrolled }))
+            return true
+        }
+
+        const prepareTarget = () => {
+            if (!isCurrent() || this.#views.get(index) !== targetView) return false
+            if (!isPreparedRelocation)
+                return commitTarget(undefined)
+            this.#cancelPreparedRelocation()
+            const controller = new AbortController()
+            this.#prepareRelocateController = controller
+            const contents = this.#getContentsForStagedView(
+                index, targetView, resolvedAnchor, targetDirection, targetLayout)
+            const preparedContents = snapshotPreparedContents(contents)
+            const gate = dispatchExtendablePrepareRelocateEvent(
+                this, { contents }, controller)
+            const finish = ready => {
+                if (this.#prepareRelocateController === controller)
+                    this.#preparingRelocation = false
+                if (!isCurrent()
+                    || this.#prepareRelocateController !== controller
+                    || this.#views.get(index) !== targetView) {
+                    rollback()
+                    return false
+                }
+                if (ready === false) {
+                    if (!isPreparedDirectNavigation) this.#stabilizing = false
+                    const retryWhenSettled = gate.settled.then(success => {
+                        if (!isCurrent()
+                            || this.#prepareRelocateController !== controller
+                            || this.#views.get(index) !== targetView) {
+                            rollback()
+                            return false
+                        }
+                        if (!success) {
+                            rollback()
+                            return false
+                        }
+                        return prepareTarget()
+                    })
+                    // Keep direct navigation in its original promise chain so
+                    // delayed cache replay cannot update history before the
+                    // highlighted target is actually committed.
+                    if (isPreparedDirectNavigation) return retryWhenSettled
+                    void retryWhenSettled.catch(error => {
+                        rollback()
+                        console.warn(error)
+                    })
+                    return false
+                }
+                return commitTarget(preparedContents)
+            }
+            if (!gate) return commitTarget(preparedContents)
+            this.#preparingRelocation = true
+            return gate.ready.then(finish)
+        }
+
+        return await prepareTarget()
     }
     // Load an adjacent section without changing primary index
-    async #loadAdjacentSection(index) {
-        if (this.#views.has(index) || !this.#canGoToIndex(index)) return
+    #loadAdjacentSection(index) {
+        const pending = this.#sectionLoadPromises.get(index)
+        if (pending) return pending
+        if (this.#views.has(index) || !this.#canGoToIndex(index)) return Promise.resolve()
+        const task = this.#loadAdjacentSectionNow(index, this.#lifecycleGeneration)
+        this.#sectionLoadPromises.set(index, task)
+        const clear = () => {
+            if (this.#sectionLoadPromises.get(index) === task)
+                this.#sectionLoadPromises.delete(index)
+        }
+        void task.then(clear, clear)
+        return task
+    }
+    async #loadAdjacentSectionNow(index, lifecycleGeneration) {
         const section = this.sections[index]
         if (!section || section.linear === 'no') return
+        let view
         try {
-            const src = await section.load()
-            const data = await section.loadContent?.()
-            const view = this.#createView(index)
-            const afterLoad = doc => {
+            const source = await this.#loadSectionSource(index, lifecycleGeneration)
+            if (!source) return
+            const { src, data } = source
+            view = this.#createView(index, true)
+            const afterLoad = async doc => {
                 if (doc.head) {
                     const $styleBefore = doc.createElement('style')
                     doc.head.prepend($styleBefore)
@@ -2017,14 +2730,16 @@ export class Paginator extends HTMLElement {
                     this.#styleMap.set(doc, [$styleBefore, $style])
                 }
                 this.setStyles(this.#styles)
-                this.dispatchEvent(new CustomEvent('load', { detail: { doc, index } }))
+                await dispatchExtendableLoadEvent(this, { doc, index })
             }
             // Adjacent sections reuse the primary view's cached layout
             // — they must NOT call #beforeRender, which would modify
             // global state (direction, CSS classes, dir attribute, etc.).
             const cachedLayout = this.#lastLayout
             const beforeRender = () => cachedLayout
-            await view.load(src, data, afterLoad, beforeRender)
+            const committed = await view.load(src, data, afterLoad, beforeRender)
+            if (!committed || lifecycleGeneration !== this.#lifecycleGeneration
+                || this.#views.get(index) !== view) return
             // Cache direction for future preload boundary checks
             if (view.document) {
                 const dir = getDirection(view.document)
@@ -2036,6 +2751,7 @@ export class Paginator extends HTMLElement {
                     return
                 }
             }
+            view.markReady()
             this.dispatchEvent(new CustomEvent('create-overlayer', {
                 detail: {
                     doc: view.document, index,
@@ -2043,6 +2759,7 @@ export class Paginator extends HTMLElement {
                 },
             }))
         } catch (e) {
+            if (view && this.#views.get(index) === view) this.#destroyView(index)
             console.warn(e)
             console.warn(new Error(`Failed to load adjacent section ${index}`))
         }
@@ -2121,7 +2838,49 @@ export class Paginator extends HTMLElement {
     #canGoToIndex(index) {
         return index >= 0 && index <= this.sections.length - 1
     }
-    async #goTo({ index, anchor, select }) {
+    #isNavigationCurrent(navigationGeneration, lifecycleGeneration) {
+        return !this.#disposed
+            && navigationGeneration === this.#navigationGeneration
+            && lifecycleGeneration === this.#lifecycleGeneration
+    }
+    async #loadSectionSource(index, lifecycleGeneration) {
+        const section = this.sections[index]
+        if (!section) return
+        const isCurrent = () => lifecycleGeneration === this.#lifecycleGeneration
+        try {
+            const src = await withTimeout(
+                Promise.resolve().then(() => section.load()),
+                SECTION_LOAD_TIMEOUT_MS,
+                `Section ${index} load`,
+            )
+            if (!isCurrent()) {
+                section.unload?.()
+                return
+            }
+            const data = section.loadContent
+                ? await withTimeout(
+                    Promise.resolve().then(() => section.loadContent()),
+                    SECTION_LOAD_TIMEOUT_MS,
+                    `Section ${index} content load`,
+                )
+                : undefined
+            if (!isCurrent()) {
+                section.unload?.()
+                return
+            }
+            return { src, data }
+        } catch (error) {
+            section.unload?.()
+            throw error
+        }
+    }
+    async #goTo({ index, anchor, select, reason }, navigationGeneration, lifecycleGeneration) {
+        const isCurrent = () => this.#isNavigationCurrent(
+            navigationGeneration, lifecycleGeneration)
+        if (!isCurrent()) return
+        const pendingSectionLoad = this.#sectionLoadPromises.get(index)
+        if (pendingSectionLoad) await pendingSectionLoad
+        if (!isCurrent()) return
         // Check if the target section has a different writing-mode.
         // If direction changes, we must destroy all views and do a full
         // rebuild via #display — mixed-direction views cannot coexist.
@@ -2138,100 +2897,163 @@ export class Paginator extends HTMLElement {
         // When direction is unknown (not cached), #beforeRender will
         // detect and clean up stale views if a change actually occurs.
 
-        if (this.#views.has(index) && !directionChanged) {
+        if (this.#views.get(index)?.ready && !directionChanged) {
             // View already loaded — reuse it without
             // clearing/reloading. Just change primary and scroll.
             this.#stabilizing = true
-            this.#container.style.opacity = '0'
+            const relocationReason = reason ?? (select ? 'selection' : 'navigation')
+            const isPreparedDirectNavigation = relocationReason === 'navigation'
+                && this.#rendered && this.#primaryView?.ready === true
+                && !!this.#primaryView?.document
+            const isPreparedRelocation = reason === 'page' || reason === 'snap'
+                || isPreparedDirectNavigation
+            if (!isPreparedRelocation) this.#container.style.opacity = '0'
+            const previousPrimaryIndex = this.#primaryIndex
+            const previousAnchor = this.#anchor
             const hasFocus = this.#primaryView?.document?.hasFocus()
-            this.#primaryIndex = index
-            this.#syncA11y()
-            this.#trimDistantViews()
+            const targetView = this.#views.get(index)
+            if (!isPreparedRelocation) {
+                this.#primaryIndex = index
+                this.#syncA11y()
+            }
+            if (!isPreparedRelocation) this.#trimDistantViews()
             // Handle short section alignment
-            const primaryView = this.#primaryView
-            if (!this.noPreload && !this.noContinuousScroll && primaryView
-                && primaryView.contentPages > 0
-                && primaryView.contentPages < this.columnCount) {
+            if (!this.noPreload && !this.noContinuousScroll && targetView
+                && targetView.contentPages > 0
+                && targetView.contentPages < this.columnCount) {
                 const sorted = this.#sortedViews
                 const firstIndex = sorted[0]?.[0]
                 if (firstIndex != null) {
                     const prevIdx = this.#adjacentIndex(-1, firstIndex)
                     if (prevIdx != null) {
                         await this.#loadAdjacentSection(prevIdx)
+                        if (!isCurrent()) return
                     }
                 }
             }
             // In noContinuousScroll mode, destroy all non-primary views
-            if (this.noContinuousScroll) {
+            if (this.noContinuousScroll && !isPreparedRelocation) {
                 for (const [i] of this.#views) {
                     if (i !== index) this.#destroyView(i)
                 }
             }
-            await this.scrollToAnchor((typeof anchor === 'function'
-                ? anchor(primaryView.document) : anchor) ?? 0, select)
+            const resolvedAnchor = (typeof anchor === 'function'
+                ? anchor(targetView.document) : anchor) ?? 0
+            const positioned = await this.#scrollToAnchor(
+                resolvedAnchor,
+                relocationReason,
+                false,
+                undefined,
+                index,
+                isPreparedRelocation,
+                isPreparedDirectNavigation,
+            )
+            if (!isCurrent()) return
+            if (positioned === false) {
+                this.#primaryIndex = this.#views.has(previousPrimaryIndex)
+                    ? previousPrimaryIndex : this.#sortedViews[0]?.[0] ?? -1
+                this.#anchor = previousAnchor
+                this.#syncA11y()
+                this.#replaceBackground()
+                this.#container.style.opacity = '1'
+                this.#stabilizing = false
+                if (hasFocus) this.focusView()
+                return false
+            }
+            if (isPreparedRelocation) {
+                this.#trimDistantViews()
+                if (this.noContinuousScroll) {
+                    for (const [i] of this.#views) {
+                        if (i !== index) this.#destroyView(i)
+                    }
+                }
+            }
             this.#container.style.opacity = '1'
             if (hasFocus) this.focusView()
             // Load remaining adjacent sections progressively;
             // keep #stabilizing true until fill completes
-            this.#fillPromise = this.#fillVisibleArea()
-            this.#fillPromise.then(() => { this.#stabilizing = false })
+            this.#startFill(() => this.#fillVisibleArea())
+            return true
         } else {
-            // When direction changes, clear ALL views — no reuse possible
-            // across writing-mode boundaries. When direction is unknown
-            // (not yet cached), keep nearby views; #beforeRender will
-            // clean up if the loaded section turns out to differ.
-            if (directionChanged) {
-                this.#destroyAllViews()
-            } else {
-                const keep = new Set([index])
-                if (!this.noContinuousScroll) {
-                    for (const [i] of this.#views) {
-                        if (Math.abs(i - index) <= 2) keep.add(i)
-                    }
-                }
-                this.#clearViewsExcept(keep)
-            }
+            // Keep the current view until #display has prepared the target.
+            // #display atomically commits the target or restores this view.
             const oldIndex = this.#primaryIndex
-            const onLoad = detail => {
+            const onLoad = async detail => {
                 if (oldIndex >= 0 && !this.#views.has(oldIndex))
                     this.sections[oldIndex]?.unload?.()
                 this.setStyles(this.#styles)
-                this.dispatchEvent(new CustomEvent('load', { detail }))
+                await dispatchExtendableLoadEvent(this, detail)
             }
-            await this.#display(Promise.resolve(this.sections[index].load())
-                .then(async src => {
-                    const data = await this.sections[index].loadContent?.()
-                    return { index, src, data, anchor, onLoad, select }
+            return await this.#display(this.#loadSectionSource(index, lifecycleGeneration)
+                .then(source => {
+                    if (!source) throw new Error(`Section ${index} load was superseded`)
+                    const { src, data } = source
+                    return { index, src, data, anchor, onLoad, select, reason }
                 }).catch(e => {
                     console.warn(e)
                     console.warn(new Error(`Failed to load section ${index}`))
-                    return {}
-                }))
+                    throw e
+                }), navigationGeneration, lifecycleGeneration)
         }
     }
     async goTo(target) {
-        if (this.#locked) return
+        if (this.#locked || this.#disposed) return
+        const lifecycleGeneration = this.#lifecycleGeneration
+        const requestGeneration = ++this.#goToRequestGeneration
         const resolved = await target
-        if (this.#canGoToIndex(resolved.index)) return this.#goTo(resolved)
+        if (this.#disposed || lifecycleGeneration !== this.#lifecycleGeneration) return
+        if (!this.#canGoToIndex(resolved.index)) return
+        if (requestGeneration < this.#latestValidGoToRequest) return
+        this.#latestValidGoToRequest = requestGeneration
+        this.#cancelPreparedRelocation()
+
+        const active = this.#directNavigationPromises.get(resolved.index)
+        if (active && active.kind !== 'snap') {
+            try {
+                await active.task
+            } catch {}
+            if (this.#disposed || lifecycleGeneration !== this.#lifecycleGeneration
+                || requestGeneration < this.#latestValidGoToRequest) return
+        }
+
+        const navigationGeneration = ++this.#navigationGeneration
+        const task = this.#goTo(resolved, navigationGeneration, lifecycleGeneration)
+        const directNavigation = { navigationGeneration, task }
+        this.#directNavigationPromises.set(resolved.index, directNavigation)
+        try {
+            return await task
+        } finally {
+            if (this.#directNavigationPromises.get(resolved.index) === directNavigation)
+                this.#directNavigationPromises.delete(resolved.index)
+        }
     }
-    #scrollPrev(distance) {
+    async #scrollPrev(distance) {
         if (this.#views.size === 0) return true
         if (this.scrolled) {
-            if (this.#renderedStart > 0) return this.#scrollTo(
-                Math.max(0, this.#renderedStart - (distance ?? this.size)), null, true)
+            if (this.#renderedStart > 0) {
+                await this.#scrollTo(
+                    Math.max(0, this.#renderedStart - (distance ?? this.size)), null, true)
+                return false
+            }
             return !this.atStart
         }
         if (this.atStart) return
         const page = this.#renderedPage - 1
         // Out of range — skip animation, go straight to previous section
         if (page < 0) return true
-        return this.#scrollToPage(page, 'page', true)
+        await this.#scrollToPage(page, 'page', true)
+        return false
     }
-    #scrollNext(distance) {
+    async #scrollNext(distance) {
         if (this.#views.size === 0) return true
         if (this.scrolled) {
-            if (this.#renderedViewSize - this.#renderedEnd > 2) return this.#scrollTo(
-                Math.min(this.#renderedViewSize, distance ? this.#renderedStart + distance : this.#renderedEnd), null, true)
+            if (this.#renderedViewSize - this.#renderedEnd > 2) {
+                await this.#scrollTo(
+                    Math.min(this.#renderedViewSize,
+                        distance ? this.#renderedStart + distance : this.#renderedEnd),
+                    null, true)
+                return false
+            }
             return !this.atEnd
         }
         if (this.atEnd) return
@@ -2239,7 +3061,8 @@ export class Paginator extends HTMLElement {
         const pages = this.#renderedPages
         // Out of range — skip animation, go straight to next section
         if (page >= pages) return true
-        return this.#scrollToPage(page, 'page', true)
+        await this.#scrollToPage(page, 'page', true)
+        return false
     }
     get atStart() {
         const sorted = this.#sortedViews
@@ -2259,26 +3082,44 @@ export class Paginator extends HTMLElement {
             if (this.sections[index]?.linear !== 'no') return index
     }
     async #turnPage(dir, distance) {
-        if (this.#locked) return
+        const hasCurrentDirectNavigation = [...this.#directNavigationPromises.values()]
+            .some(({ navigationGeneration }) =>
+                navigationGeneration === this.#navigationGeneration)
+        if (this.#locked || this.#disposed || hasCurrentDirectNavigation
+            || (this.#primaryView && !this.#primaryView.ready)) return
+        const lifecycleGeneration = this.#lifecycleGeneration
+        const navigationGeneration = this.#navigationGeneration
         this.#locked = true
-        const prev = dir === -1
-        const shouldGo = await (prev ? this.#scrollPrev(distance) : this.#scrollNext(distance))
-        if (shouldGo) {
-            // Wait for any in-progress background pre-loading to complete —
-            // it may already be loading the section we need, so awaiting
-            // it lets #goTo reuse the view instead of loading from scratch
-            if (this.#fillPromise) await this.#fillPromise
-            const sorted = this.#sortedViews
-            const edgeIndex = prev
-                ? sorted[0]?.[0] ?? this.#primaryIndex
-                : sorted[sorted.length - 1]?.[0] ?? this.#primaryIndex
-            await this.#goTo({
-                index: this.#adjacentIndex(dir, edgeIndex),
-                anchor: prev ? () => 1 : () => 0,
-            })
+        try {
+            const prev = dir === -1
+            const shouldGo = await (prev ? this.#scrollPrev(distance) : this.#scrollNext(distance))
+            if (!this.#isNavigationCurrent(navigationGeneration, lifecycleGeneration)) return
+            if (shouldGo) {
+                const sorted = this.#sortedViews.filter(
+                    ([index]) => !this.#sectionLoadPromises.has(index))
+                const edgeIndex = prev
+                    ? sorted[0]?.[0] ?? this.#primaryIndex
+                    : sorted[sorted.length - 1]?.[0] ?? this.#primaryIndex
+                const targetIndex = this.#adjacentIndex(dir, edgeIndex)
+                if (targetIndex != null) {
+                    this.#cancelPreparedRelocation()
+                    const targetNavigationGeneration = ++this.#navigationGeneration
+                    // Join only the target section's single-flight load. Farther
+                    // background fill work must not delay this page turn.
+                    await this.#loadAdjacentSection(targetIndex)
+                    if (!this.#isNavigationCurrent(
+                        targetNavigationGeneration, lifecycleGeneration)) return
+                    await this.#goTo({
+                        index: targetIndex,
+                        anchor: prev ? () => 1 : () => 0,
+                        reason: 'page',
+                    }, targetNavigationGeneration, lifecycleGeneration)
+                }
+            }
+            if (shouldGo || !this.hasAttribute('animated')) await wait(100)
+        } finally {
+            this.#locked = false
         }
-        if (shouldGo || !this.hasAttribute('animated')) await wait(100)
-        this.#locked = false
     }
     async prev(distance) {
         return await this.#turnPage(-1, distance)
@@ -2288,6 +3129,7 @@ export class Paginator extends HTMLElement {
     }
     async pan(dx, dy) {
         if (this.#locked) return
+        this.#cancelPreparedRelocation()
         this.#locked = true
         this.scrollBy(dx, dy)
         this.#locked = false
@@ -2352,7 +3194,14 @@ export class Paginator extends HTMLElement {
         this.#primaryView?.destroyLoupe()
     }
     destroy() {
-        this.#observer.unobserve(this)
+        this.#cancelPreparedRelocation()
+        this.#disposed = true
+        this.#lifecycleGeneration++
+        this.#navigationGeneration++
+        this.#sectionLoadPromises.clear()
+        this.#directNavigationPromises.clear()
+        this.#fillPromise = null
+        this.#observer.unobserve(this.#container)
         this.#destroyAllViews()
         this.#mediaQuery.removeEventListener('change', this.#mediaQueryListener)
     }

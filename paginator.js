@@ -124,6 +124,18 @@ const debounce = (f, wait, immediate) => {
     }
 }
 
+const MAX_ANIMATED_PAGE_SPAN = 32
+
+const canAnimateScroll = (element, scrollProp) => {
+    const horizontal = scrollProp === 'scrollLeft'
+    const viewportSize = horizontal ? element.clientWidth : element.clientHeight
+    if (!viewportSize) return false
+    return [...element.children].every(child => {
+        const contentSize = horizontal ? child.offsetWidth : child.offsetHeight
+        return contentSize <= viewportSize * MAX_ANIMATED_PAGE_SPAN
+    })
+}
+
 // Transforms ALL children of the container so multi-view layouts
 // animate as a unified whole. Extra elements (e.g. background) are
 // also transformed so they slide in sync with the content.
@@ -252,7 +264,69 @@ const getBoundingClientRect = target => {
     return new DOMRect(left, top, right - left, bottom - top)
 }
 
-const getVisibleRange = (doc, start, end, mapRect) => {
+const getVisibleRangeFromPoints = (doc, start, end, mapRect, pointAt) => {
+    if (typeof doc.caretRangeFromPoint !== 'function' || !pointAt) return
+    const width = Math.max(1, end - start)
+    const height = Math.max(
+        1,
+        doc.documentElement?.clientHeight ?? 0,
+        doc.defaultView?.innerHeight ?? 0,
+    )
+    const inlineOffsets = [0.01, 0.5, 0.99]
+    const blockOffsets = [0.01, 0.08, 0.2, 0.4, 0.6, 0.8, 0.92, 0.99]
+    const candidates = []
+
+    for (const blockOffset of blockOffsets) {
+        for (const inlineOffset of inlineOffsets) {
+            const { x, y } = pointAt(
+                start + width * inlineOffset,
+                height * blockOffset,
+            )
+            let caret
+            try {
+                caret = doc.caretRangeFromPoint(x, y)
+            } catch {
+                continue
+            }
+            if (!caret?.startContainer || !doc.body?.contains(caret.startContainer)) continue
+            const element = caret.startContainer.nodeType === Node.ELEMENT_NODE
+                ? caret.startContainer
+                : caret.startContainer.parentElement
+            if (!element || element.closest('script, style')) continue
+            try {
+                const { left, right } = mapRect(element.getBoundingClientRect())
+                if (left === 0 && right === 0) continue
+                if (right < start || left > end) continue
+            } catch {
+                continue
+            }
+            candidates.push(caret)
+        }
+    }
+
+    if (candidates.length < 2) return
+    candidates.sort((a, b) =>
+        a.compareBoundaryPoints(Range.START_TO_START, b))
+    const first = candidates[0]
+    const last = candidates[candidates.length - 1]
+    if (first.compareBoundaryPoints(Range.START_TO_START, last) === 0) return
+    const range = doc.createRange()
+    try {
+        range.setStart(first.startContainer, first.startOffset)
+        range.setEnd(last.startContainer, last.startOffset)
+    } catch {
+        return
+    }
+    return range.collapsed ? undefined : range
+}
+
+const getVisibleRange = (doc, start, end, mapRect, pointAt = mapRect.pointAt) => {
+    // A paginated chapter can contain hundreds of columns in one iframe.
+    // Chromium's caret hit-testing uses its layout index, while walking every
+    // node and reading every rect forces a full main-thread layout on each turn.
+    const pointRange = getVisibleRangeFromPoints(doc, start, end, mapRect, pointAt)
+    if (pointRange) return pointRange
+
     // first get all visible nodes
     const acceptNode = node => {
         const name = node.localName?.toLowerCase()
@@ -1116,22 +1190,10 @@ export class Paginator extends HTMLElement {
             overflow: hidden;
             display: flex;
             flex-direction: row;
-            /* GPU acceleration hints for smoother scrolling on high refresh rate displays */
-            transform: translateZ(0);
-            backface-visibility: hidden;
-            -webkit-backface-visibility: hidden;
-            perspective: 1000px;
-            -webkit-perspective: 1000px;
             transition: opacity 50ms ease-in;
         }
         #container.vertical {
             flex-direction: column;
-        }
-        #container > * {
-            /* Ensure child elements are GPU-accelerated for smooth transform animations */
-            transform: translateZ(0);
-            backface-visibility: hidden;
-            -webkit-backface-visibility: hidden;
         }
         :host([flow="scrolled"]) #container {
             grid-column: 2 / 5;
@@ -1935,12 +1997,16 @@ export class Paginator extends HTMLElement {
         const pxSize = view
             ? view.element.getBoundingClientRect()[sideProp]
             : this.#renderedPages * this.size
-        return rtl
+        const mapRect = rtl
             ? ({ left, right }) =>
                 ({ left: pxSize - right, right: pxSize - left })
             : vertical
                 ? ({ top, bottom }) => ({ left: top, right: bottom })
                 : f => f
+        if (!rtl && !vertical) {
+            mapRect.pointAt = (inline, block) => ({ x: inline, y: block })
+        }
+        return mapRect
     }
     async #scrollToRect(rect, reason, preparedContents,
         primaryIndex = this.#primaryIndex, prepareRelocation = false,
@@ -1983,7 +2049,10 @@ export class Paginator extends HTMLElement {
         }
         // FIXME: vertical-rl only, not -lr
         if (this.scrolled && this.#vertical) offset = -offset
-        if ((reason === 'snap' || smooth) && this.hasAttribute('animated') && !this.hasAttribute('eink')) {
+        if ((reason === 'snap' || smooth)
+            && this.hasAttribute('animated')
+            && !this.hasAttribute('eink')
+            && canAnimateScroll(this.#container, this.scrollProp)) {
             const startPosition = this.containerPosition
             // Pre-set background for the destination so it's already
             // correct when the slide animation reveals the new page
@@ -3208,3 +3277,8 @@ export class Paginator extends HTMLElement {
 }
 
 customElements.define('foliate-paginator', Paginator)
+
+export {
+    canAnimateScroll as __canAnimateScrollForTest,
+    getVisibleRange as __getVisibleRangeForTest,
+}

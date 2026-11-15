@@ -1,3 +1,5 @@
+import { sanitizeDocument } from './sanitize.js'
+
 const normalizeWhitespace = str => str ? str
     .replace(/[\t\n\f\r ]+/g, ' ')
     .replace(/^[\t\n\f\r ]+/, '')
@@ -294,7 +296,10 @@ export const makeFB2 = async blob => {
         }))
         .map(({ ids, titles, el, linear }) => {
             const str = template(el.outerHTML)
-            const blob = new Blob([str], { type: MIME.XHTML })
+            const doc = sanitizeDocument(
+                new DOMParser().parseFromString(str, MIME.XHTML))
+            const safeStr = new XMLSerializer().serializeToString(doc)
+            const blob = new Blob([safeStr], { type: MIME.XHTML })
             const url = URL.createObjectURL(blob)
             urls.push(url)
             const title = normalizeWhitespace(
@@ -302,7 +307,7 @@ export const makeFB2 = async blob => {
                 ?? (el.classList.contains('title') ? el.textContent : ''))
             return {
                 ids, title, titles, load: () => url,
-                createDocument: () => new DOMParser().parseFromString(str, MIME.XHTML),
+                createDocument: () => new DOMParser().parseFromString(safeStr, MIME.XHTML),
                 // doo't count image data as it'd skew the size too much
                 size: blob.size - Array.from(el.querySelectorAll('[src]'),
                     el => el.getAttribute('src')?.length ?? 0)

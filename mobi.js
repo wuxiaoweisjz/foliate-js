@@ -1,3 +1,5 @@
+import { sanitizeDocument } from './sanitize.js'
+
 const unescapeHTML = str => {
     if (!str) return ''
     const textarea = document.createElement('textarea')
@@ -1034,7 +1036,8 @@ class MOBI6 {
     }
     async createDocument(section) {
         const str = await this.loadText(section)
-        return this.parser.parseFromString(this.#sanitize(str), this.#type)
+        return sanitizeDocument(
+            this.parser.parseFromString(this.#sanitize(str), this.#type))
     }
     async loadSection(section) {
         if (this.#cache.has(section)) return this.#cache.get(section)
@@ -1388,7 +1391,7 @@ export class KF8 {
     }
     async createDocument(section) {
         const str = await this.loadText(section)
-        return this.parser.parseFromString(str, this.#type)
+        return sanitizeDocument(this.parser.parseFromString(str, this.#type))
     }
     loadSection(section) {
         if (this.#cache.has(section)) return this.#cache.get(section)
@@ -1406,6 +1409,7 @@ export class KF8 {
                 for (const el of doc.querySelectorAll(`img[src="${url}"]`))
                     el.replaceWith(node.cloneNode(true))
             }
+            sanitizeDocument(doc)
             const url = URL.createObjectURL(
                 new Blob([this.serializer.serializeToString(doc)], { type: this.#type }))
             this.#sectionURLs.add(url)

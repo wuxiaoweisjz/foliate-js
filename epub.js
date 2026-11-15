@@ -1,4 +1,5 @@
 import * as CFI from './epubcfi.js'
+import { sanitizeDocument } from './sanitize.js'
 
 const NS = {
     CONTAINER: 'urn:oasis:names:tc:opendocument:xmlns:container',
@@ -1079,7 +1080,7 @@ class Loader {
             const applyReplacements = await mapConcurrent(
                 replacements, replace => replace())
             for (const apply of applyReplacements) apply()
-            // TODO: replace inline scripts? probably not worth the trouble
+            sanitizeDocument(doc)
             const result = new XMLSerializer().serializeToString(doc)
             return this.createURL(href, result, item.mediaType, parent)
         }
@@ -1296,7 +1297,7 @@ ${doc.querySelector('parsererror').innerText}`)
     }
     async loadDocument(item) {
         const str = await this.loadText(item.href)
-        return this.parser.parseFromString(str, item.mediaType)
+        return sanitizeDocument(this.parser.parseFromString(str, item.mediaType))
     }
     getMediaOverlay() {
         return new MediaOverlay(this, this.#loadXML.bind(this))

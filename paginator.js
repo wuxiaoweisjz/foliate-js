@@ -850,6 +850,11 @@ class View {
             // This allows adjacent sections to share a spread when a
             // section doesn't fill all available columns.
             const columnSize = this.#size / this.#columnCount
+            // A layout pass can run while the host is still zero-sized (for
+            // example a concealed reader or a section swap). Writing NaN/0
+            // widths here drops the column box and leaves the chapter as one
+            // full-width overflowing column until something forces a reflow.
+            if (!Number.isFinite(columnSize) || columnSize <= 0) return
             const pageCount = Math.ceil(contentSize / columnSize)
             this.#contentPages = pageCount
             const expandedSize = pageCount * columnSize
@@ -1852,22 +1857,37 @@ export class Paginator extends HTMLElement {
     // dt: total time of the swipe (ms)
     snap(vx, vy, dx, dy, dt) {
         if (this.#disposed) return
-        const velocity = this.#vertical ? vy : vx
-        const avgVelocity = this.#vertical ? dy / dt : dx / dt
-        const horizontal = Math.abs(vx) * 2 > Math.abs(vy)
-        const orthogonal = this.#vertical ? !horizontal : horizontal
-        const [offset, a, b] = this.#scrollBounds
         const size = this.size
+        if (!size) return
+        const velocity = this.#vertical ? vy : vx
+        const distance = this.#vertical ? dy : dx
+        const crossDistance = this.#vertical ? dx : dy
+        const averageVelocity = dt > 0 ? distance / dt : 0
+        const [offset, a, b] = this.#scrollBounds
         const start = this.#renderedStart
         const end = this.#renderedEnd
         const pages = this.#renderedPages
         const min = Math.abs(offset) - a
         const max = Math.abs(offset) + b
-        const snapping = this.hasAttribute('animated') && !this.hasAttribute('eink')
-        const v =  snapping ? velocity : avgVelocity
-        const d = v * (this.#rtl ? -size : size) * (orthogonal ? 1 : 0)
-        const snapOffset = (isNaN(d) ? 0 : snapping ? d * 2 : d * 10)
-        const page = Math.floor(Math.max(min, Math.min(max, (start + end) / 2 + snapOffset)) / size)
+
+        // Decide from the whole gesture rather than the last touchmove's
+        // velocity. That velocity is noisy (users routinely slow the finger
+        // down before lifting), which made gentle swipes stay on the current
+        // page and briefly leave two pages half-visible. Either a deliberate
+        // drag past a small threshold or a flick now turns exactly one page.
+        const alongAxis = Math.abs(distance) >= Math.abs(crossDistance)
+        const dragged = Math.abs(distance) >= size * 0.06
+        const flicked = (Number.isFinite(velocity) && Math.abs(velocity) >= 0.25)
+            || (Number.isFinite(averageVelocity) && Math.abs(averageVelocity) >= 0.35)
+        const direction = Math.sign(distance) || Math.sign(velocity)
+        const turned = alongAxis && direction !== 0 && (dragged || flicked)
+        const pageDelta = turned ? (direction > 0 ? 1 : -1) * (this.#rtl ? -1 : 1) : 0
+        const basePage = Number.isFinite(this.#touchState?.page)
+            ? this.#touchState.page
+            : Math.floor(((start + end) / 2) / size)
+        const minPage = Math.floor(min / size)
+        const maxPage = Math.floor(max / size)
+        const page = Math.max(minPage, Math.min(maxPage, basePage + pageDelta))
         const dir = page < 0 ? -1 : page >= pages ? 1 : null
         const doGoTo = () => {
             if (!dir) return
@@ -1904,6 +1924,7 @@ export class Paginator extends HTMLElement {
             vx: 0, xy: 0,
             dx: 0, dy: 0,
             dt: 0,
+            page: this.#renderedPage,
         }
         // Hint to browser that scrolling will occur for better GPU layer management
         const pv = this.#primaryView

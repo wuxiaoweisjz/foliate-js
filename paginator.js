@@ -2862,6 +2862,7 @@ export class Paginator extends HTMLElement {
     async #fillVisibleArea({ reanchor = true } = {}) {
         if (this.noPreload || this.noContinuousScroll || this.#filling) return
         this.#filling = true
+        let loadedPrevious = false
         try {
             const { size } = this
             if (!size) return
@@ -2880,6 +2881,7 @@ export class Paginator extends HTMLElement {
                     const prevIdx = this.#adjacentIndex(-1, firstIndex)
                     if (prevIdx != null && this.#isSameDirection(prevIdx)) {
                         await this.#loadAdjacentSection(prevIdx)
+                        loadedPrevious = true
                     }
                 }
             }
@@ -2901,7 +2903,12 @@ export class Paginator extends HTMLElement {
                 await this.#loadAdjacentSection(nextIdx)
                 if (!this.#views.has(nextIdx)) break
             }
-            if (reanchor) this.#scrollToAnchor(this.#anchor)
+            // Forward prefetch does not move existing content. Only re-anchor
+            // when a previous section was inserted and shifted the layout.
+            // Re-anchoring after a direct goTo can otherwise overwrite the
+            // requested CFI with the page that happened to be visible when
+            // the fill started.
+            if (reanchor && loadedPrevious) this.#scrollToAnchor(this.#anchor)
         } finally {
             this.#filling = false
             // Emit stabilized so post-layout processing (e.g. warichu)

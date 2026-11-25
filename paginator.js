@@ -1123,6 +1123,10 @@ export class Paginator extends HTMLElement {
     #disposed = false
     #stabilizing = false // true while #display is stabilizing layout
     #rendered = false // true after first #display completes
+    // Last page published by a deliberate relocation (page/snap/anchor/
+    // navigation). A later `container-scroll` is a layout echo, so it may
+    // only publish when the settled page actually differs from this value.
+    #lastRelocatedPage = null
     #lastLayout = null // cached layout from the last #beforeRender call
     // Cache of section index → vertical (boolean). Populated as views
     // are loaded so we can check direction *before* loading a section.
@@ -1283,7 +1287,15 @@ export class Paginator extends HTMLElement {
                     }
                 }
             } else if (!this.scrolled) {
-              this.#afterScroll('container-scroll')
+                // A native container scroll in paginated mode is a layout
+                // side effect (animation, re-anchor, or fill insertion), not
+                // an independent position change. The page/snap relocation
+                // already emitted its target; recomputing here can briefly
+                // publish the previous page while neighbouring sections are
+                // still settling (16 → 17 → 16).
+                if (this.#isAnimating || this.#stabilizing
+                    || this.#filling || this.#preparingRelocation) return
+                this.#afterScroll('container-scroll')
             }
         }, 250)
         this.#container.addEventListener('scroll', () => {
@@ -2437,8 +2449,16 @@ export class Paginator extends HTMLElement {
         const pagesBeforePrimary = this.#getPagesBeforeView(primaryIndex)
         const textPages = primaryView.contentPages
         if (!textPages) return
-        // textPages is in column units; convert to spread page for scrolling
-        const newColumn = Math.round(anchor * (textPages - 1))
+        // textPages is in column units; convert to spread page for scrolling.
+        // `#afterScroll` reports fraction as `localColumn / textPages`, so the
+        // inverse must multiply by `textPages` (not `textPages - 1`). The old
+        // `-1` made a round trip lose a column and could publish page 16 after
+        // the reader had already moved to 17. Clamp the end anchor to the last
+        // real column.
+        const newColumn = Math.min(
+            textPages - 1,
+            Math.max(0, Math.round(anchor * textPages)),
+        )
         const newSpreadPage = Math.floor(newColumn / this.columnCount)
         return await this.#scrollToPage(
             pagesBeforePrimary + newSpreadPage,
@@ -2611,6 +2631,12 @@ export class Paginator extends HTMLElement {
             detail.fraction = textPages > 0 ? Math.max(0, Math.min(1, localColumn / textPages)) : 0
             detail.size = textPages > 0 ? this.columnCount / textPages : 1
             if (reason === 'container-scroll' && localPage === 0) return
+            // A page/snap relocation already published the target. The native
+            // scroll event it triggers arrives 250ms later and recomputes from
+            // the still-settling layout; when it agrees, emitting again only
+            // risks a transient backward page (16 → 17 → 16 → 17).
+            if (reason === 'container-scroll' && this.#lastRelocatedPage === page) return
+            if (reason !== 'container-scroll') this.#lastRelocatedPage = page
         }
         // Update per-column backgrounds for the current scroll position
         if (!this.scrolled) this.#replaceBackground()

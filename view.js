@@ -263,6 +263,8 @@ export class View extends HTMLElement {
         this.renderer.setAttribute('exportparts', 'head,foot,filter,container')
         this.renderer.addEventListener('load', e => this.#onLoad(e.detail))
         this.renderer.addEventListener('relocate', e => this.#onRelocate(e.detail))
+        this.renderer.addEventListener('progress-relocate',
+            e => this.#onProgressRelocate(e.detail))
         this.renderer.addEventListener('create-overlayer', e =>
             e.detail.attach(this.#createOverlayer(e.detail)))
         this.renderer.open(book)
@@ -338,6 +340,24 @@ export class View extends HTMLElement {
         if (reason === 'snap' || reason === 'page' || reason === 'scroll')
             this.history.replaceState(cfi)
         this.#emit('relocate', this.lastLocation)
+    }
+    // Early position event for page turns whose highlight gate is still
+    // pending. It carries the target CFI and section fraction so the reader can
+    // update the page indicator and autosave without waiting for highlights.
+    #onProgressRelocate({ reason, range, index, fraction, size, atEnd }) {
+        const progress = this.#sectionProgress?.getProgress(index, fraction, size) ?? {}
+        const tocItem = this.#tocProgress?.getProgress(index, range)
+        const pageItem = this.#pageProgress?.getProgress(index, range)
+        const cfi = this.getCFI(index, range)
+        this.#emit('progress-relocate', {
+            ...progress,
+            atEnd: atEnd === true,
+            tocItem,
+            pageItem,
+            cfi,
+            range,
+            reason,
+        })
     }
     #onLoad(detail) {
         const { doc, index } = detail

@@ -2267,6 +2267,13 @@ export class Paginator extends HTMLElement {
         prepareRelocation = false, beforeCommit) {
         const offset = this.size * (this.#rtl ? -page : page)
         this.#cancelPreparedRelocation()
+        // Emit the position before the highlight gate, including section
+        // crossings where preparedContents is already available. Previously
+        // the boundary path returned directly and the footer waited for the
+        // gated relocate event.
+        if (reason === 'page' || reason === 'snap') {
+            this.#emitProgressRelocateForPage(page, reason)
+        }
         if (preparedContents !== undefined) {
             beforeCommit?.()
             return this.#scrollTo(offset, reason, smooth, preparedContents, primaryIndex)
@@ -2333,6 +2340,38 @@ export class Paginator extends HTMLElement {
             return gate.ready.then(commit)
         }
         return prepare()
+    }
+    // Progress is a position fact, not a highlight fact. Emit it as soon as
+    // the target page is known so page numbers and persisted CFIs do not wait
+    // for the target page's vocabulary cache. The regular `relocate` event
+    // still waits for highlight preparation, so the visual gate is unchanged.
+    #emitProgressRelocateForPage(page, reason) {
+        const size = this.size
+        if (!size || this.#renderedPages <= 0) return
+        const offset = size * (this.#rtl ? -page : page)
+        const maxStart = Math.max(0, this.#renderedViewSize - size)
+        const start = Math.max(0, Math.min(Math.abs(offset), maxStart))
+        const contents = this.#getContentsForRenderedWindow(start, start + size)
+        const primary = contents[0]
+        if (!primary) return
+        const view = this.#views.get(primary.index)
+        if (!view) return
+        const textPages = view.contentPages
+        const pagesBeforePrimary = this.#getPagesBeforeView(primary.index)
+        const localPage = page - pagesBeforePrimary
+        const localColumn = localPage * this.columnCount
+        const targetPage = Math.max(0, Math.min(page, this.#renderedPages - 1))
+        this.dispatchEvent(new CustomEvent('progress-relocate', {
+            detail: {
+                reason,
+                atEnd: targetPage >= this.#renderedPages - 1,
+                range: primary.range,
+                index: primary.index,
+                fraction: textPages > 0
+                    ? Math.max(0, Math.min(1, localColumn / textPages)) : 0,
+                size: textPages > 0 ? this.columnCount / textPages : 1,
+            },
+        }))
     }
     async scrollToAnchor(anchor, select, smooth) {
         return this.#scrollToAnchor(anchor, select ? 'selection' : 'navigation', smooth)
